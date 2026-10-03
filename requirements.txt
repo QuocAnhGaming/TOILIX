@@ -1,0 +1,7 @@
+discord.py
+python-dotenv
+requests
+Pillow
+imageio
+imageio-ffmpeg
+openai
