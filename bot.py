@@ -32,7 +32,7 @@ SUPPORT_CHANNEL_ID = int(os.getenv("SUPPORT_CHANNEL_ID", "0") or 0)
 
 # FREE: giữ AI cũ của bot (Gemini).
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
 
 # STANDARD/PREMIUM: AI mới qua OpenAI. Đổi model bằng .env.
 STANDARD_MODEL = os.getenv("STANDARD_MODEL", "gpt-6-sol")
@@ -315,8 +315,6 @@ def set_language(channel_id, guild_id, language):
 
 
 def tr(channel_id, english, vietnamese):
-    # UI language is determined ONLY by the current channel setting.
-    # It never changes automatically from the user's message language.
     return vietnamese if get_language(channel_id) == LANG_VI else english
 
 
@@ -877,7 +875,7 @@ def get_gif_keywords(guild_id):
 # =========================================================
 
 def ask_gemini(prompt):
-    """Free AI backend. Uses the Gemini API through HTTPS; no Ollama is required."""
+    """Free AI backend. Uses Gemini API through HTTPS; no Gemini/OpenAI required."""
     if not GEMINI_API_KEY:
         print("[GEMINI ERROR] GEMINI_API_KEY is missing.")
         return None
@@ -1215,13 +1213,7 @@ def build_ai_prompt(message):
     language_name = LANGUAGE_LABELS.get(get_language(message.channel.id), "English")
 
     prompt = f"""
-You are a Discord AI chatbot.
-
-LANGUAGE RULE (MANDATORY):
-- The current channel language is {language_name}.
-- Reply ONLY in {language_name}.
-- Never switch language just because the user's message is written in another language.
-- Keep proper names, technical terms, code, and commands unchanged when necessary.
+Bạn là một Discord AI chatbot.
 
 MỤC TIÊU:
 - Hiểu ngữ cảnh tốt.
@@ -1230,6 +1222,7 @@ MỤC TIÊU:
 - Không bịa thông tin.
 - Không lặp lại chính mình.
 - PHẢI trả lời CHỈ bằng {language_name}.
+- Không tự đổi ngôn ngữ theo ngôn ngữ người dùng.
 - Không trộn ngôn ngữ trừ khi một tên riêng, thuật ngữ hoặc đoạn mã bắt buộc phải giữ nguyên.
 
 VIBE:
@@ -1399,24 +1392,22 @@ async def on_ready():
 async def language_command(interaction: discord.Interaction, language: app_commands.Choice[str]):
     if not interaction.guild or not interaction.channel:
         await interaction.response.send_message(
-            tr(
-                interaction.channel.id if interaction.channel else 0,
-                "This command can only be used in a server." if not interaction.guild else "Channel information is unavailable.",
-                "Lệnh này chỉ có thể dùng trong server." if not interaction.guild else "Không thể xác định channel.",
-            ),
+            "This command can only be used in a server." if not interaction.guild
+            else "Channel information is unavailable.",
             ephemeral=True,
         )
         return
 
     set_language(interaction.channel.id, interaction.guild.id, language.value)
 
-    await interaction.response.send_message(
-        tr(
-            interaction.channel.id,
-            "🇬🇧 Bot language has been set to English for this channel.",
-            "🇻🇳 Đã chuyển ngôn ngữ bot sang Tiếng Việt cho channel này.",
+    if language.value == LANG_VI:
+        await interaction.response.send_message(
+            "🇻🇳 Đã chuyển ngôn ngữ bot sang Tiếng Việt cho channel này."
         )
-    )
+    else:
+        await interaction.response.send_message(
+            "🇬🇧 Bot language has been set to English for this channel."
+        )
 
 
 @bot.command(name="language")
