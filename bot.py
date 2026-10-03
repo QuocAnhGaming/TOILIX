@@ -169,6 +169,13 @@ def init_db():
     """)
 
     cur.execute("""
+        CREATE TABLE IF NOT EXISTS language_settings (
+            guild_id INTEGER PRIMARY KEY,
+            language TEXT NOT NULL DEFAULT 'en'
+        )
+    """)
+
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS premium_plans (
             guild_id INTEGER PRIMARY KEY,
             plan TEXT NOT NULL DEFAULT 'free',
@@ -248,6 +255,36 @@ def openai_available():
     return OpenAI is not None and bool(OPENAI_API_KEY)
 
 OPENAI_CLIENT = OpenAI(api_key=OPENAI_API_KEY) if openai_available() else None
+
+# =========================================================
+# LANGUAGE
+# =========================================================
+
+LANG_EN = "en"
+LANG_VI = "vi"
+LANGUAGE_LABELS = {LANG_EN: "English", LANG_VI: "Tiếng Việt"}
+
+def get_language(guild_id):
+    if not guild_id:
+        return LANG_EN
+    conn = get_db()
+    row = conn.execute("SELECT language FROM language_settings WHERE guild_id = ?", (guild_id,)).fetchone()
+    conn.close()
+    return row[0] if row and row[0] in (LANG_EN, LANG_VI) else LANG_EN
+
+def set_language(guild_id, language):
+    language = language if language in (LANG_EN, LANG_VI) else LANG_EN
+    conn = get_db()
+    conn.execute("""
+        INSERT INTO language_settings (guild_id, language) VALUES (?, ?)
+        ON CONFLICT(guild_id) DO UPDATE SET language = excluded.language
+    """, (guild_id, language))
+    conn.commit()
+    conn.close()
+
+def tr(guild_id, english, vietnamese):
+    return vietnamese if get_language(guild_id) == LANG_VI else english
+
 
 # =========================================================
 # SETTINGS
@@ -1080,6 +1117,7 @@ def build_ai_prompt(message):
     gif_memory = get_server_gif_memory(guild_id, limits["gifs"])
 
     current = clean_message_content(message)
+    language_name = LANGUAGE_LABELS.get(get_language(guild_id), "English")
 
     prompt = f"""
 Bạn là một Discord AI chatbot.
@@ -1247,7 +1285,39 @@ async def on_ready():
 # SLASH COMMANDS
 # =========================================================
 
-@bot.tree.command(name="ai_on", description="Bật AI chatbot")
+@bot.tree.command(name="language", description="Choose the bot language for this server")
+@app_commands.describe(language="Choose English or Vietnamese")
+@app_commands.choices(language=[
+    app_commands.Choice(name="English", value="en"),
+    app_commands.Choice(name="Tiếng Việt", value="vi"),
+])
+async def language_command(interaction: discord.Interaction, language: app_commands.Choice[str]):
+    if not interaction.guild:
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+        return
+    set_language(interaction.guild.id, language.value)
+    if language.value == LANG_VI:
+        await interaction.response.send_message("🇻🇳 Đã chuyển ngôn ngữ bot sang Tiếng Việt.")
+    else:
+        await interaction.response.send_message("🇬🇧 Bot language has been set to English.")
+
+@bot.command(name="language")
+async def language_prefix(ctx, language: str = ""):
+    if not ctx.guild:
+        await ctx.send("This command can only be used in a server.")
+        return
+    value = language.lower().strip()
+    if value in ("vi", "vietnamese", "tiengviet", "tiếng_việt"):
+        set_language(ctx.guild.id, LANG_VI)
+        await ctx.send("🇻🇳 Đã chuyển ngôn ngữ bot sang Tiếng Việt.")
+    elif value in ("en", "english"):
+        set_language(ctx.guild.id, LANG_EN)
+        await ctx.send("🇬🇧 Bot language has been set to English.")
+    else:
+        await ctx.send("Use `!language en` or `!language vi`. You can also use `/language`.")
+
+
+@bot.tree.command(name="ai_on", description="Enable the AI chatbot")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def ai_on(interaction: discord.Interaction):
     guild_id = interaction.guild.id
@@ -1259,10 +1329,10 @@ async def ai_on(interaction: discord.Interaction):
     save_settings(guild_id)
     seed_default_genz()
 
-    await interaction.response.send_message("🤖 AI đã bật.")
+    await interaction.response.send_message(tr(guild_id, "🤖 AI enabled.", "🤖 AI đã bật."))
 
 
-@bot.tree.command(name="ai_off", description="Tắt AI chatbot")
+@bot.tree.command(name="ai_off", description="Disable the AI chatbot")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def ai_off(interaction: discord.Interaction):
     guild_id = interaction.guild.id
@@ -1270,12 +1340,12 @@ async def ai_off(interaction: discord.Interaction):
     ai_enabled[guild_id] = False
     save_settings(guild_id)
 
-    await interaction.response.send_message("🛑 AI đã tắt.")
+    await interaction.response.send_message(tr(guild_id, "🛑 AI disabled.", "🛑 AI đã tắt."))
 
 
 @bot.tree.command(
     name="ai_channel",
-    description="Chọn channel cho AI"
+    description="Choose the channel where AI can reply"
 )
 @app_commands.checks.has_permissions(manage_guild=True)
 async def ai_channel(
@@ -1287,14 +1357,12 @@ async def ai_channel(
     ai_channels[guild_id] = channel.id
     save_settings(guild_id)
 
-    await interaction.response.send_message(
-        f"✅ AI hoạt động ở {channel.mention}"
-    )
+    await interaction.response.send_message(tr(guild_id, f"✅ AI is active in {channel.mention}", f"✅ AI hoạt động ở {channel.mention}"))
 
 
 @bot.tree.command(
     name="ai_interval",
-    description="Đặt interval theo gói server"
+    description="Set the reply interval for this server plan"
 )
 @app_commands.checks.has_permissions(manage_guild=True)
 async def ai_interval(
@@ -1314,13 +1382,10 @@ async def ai_interval(
     message_counts[guild_id] = 0
     save_settings(guild_id)
 
-    await interaction.response.send_message(
-        f"✅ Interval = **{interval}**\n"
-        f"🎲 Early reply = **25%**"
-    )
+    await interaction.response.send_message(tr(guild_id, f"✅ Interval = **{interval}**\n🎲 Early reply = **25%**", f"✅ Interval = **{interval}**\n🎲 Early reply = **25%**"))
 
 
-@bot.tree.command(name="status", description="Xem trạng thái AI")
+@bot.tree.command(name="status", description="View AI status")
 async def status(interaction: discord.Interaction):
     guild_id = interaction.guild.id
 
@@ -1360,7 +1425,7 @@ Self-learning: ON
 
 @bot.tree.command(
     name="ai_memory",
-    description="Xem memory AI"
+    description="View AI memory"
 )
 async def ai_memory(interaction: discord.Interaction):
     guild_id = interaction.guild.id
@@ -1393,7 +1458,7 @@ async def ai_memory(interaction: discord.Interaction):
 
 @bot.tree.command(
     name="genz_add",
-    description="Thêm slang/meme vào từ điển server"
+    description="Add slang or memes to the server dictionary"
 )
 @app_commands.checks.has_permissions(manage_guild=True)
 async def genz_add(
@@ -1410,13 +1475,13 @@ async def genz_add(
     )
 
     await interaction.response.send_message(
-        f"🧠 Đã thêm `{term}` vào Gen Z dictionary."
+        tr(interaction.guild.id, f"🧠 Added `{term}` to the Gen Z dictionary.", f"🧠 Đã thêm `{term}` vào Gen Z dictionary.")
     )
 
 
 @bot.tree.command(
     name="gif_add",
-    description="Thêm GIF URL vào thư viện server"
+    description="Add a GIF URL to the server library"
 )
 @app_commands.checks.has_permissions(manage_guild=True)
 async def gif_add(
@@ -1429,7 +1494,7 @@ async def gif_add(
         or url.startswith("http://")
     ):
         await interaction.response.send_message(
-            "❌ URL không hợp lệ.",
+            tr(interaction.guild.id, "❌ Invalid URL.", "❌ URL không hợp lệ."),
             ephemeral=True
         )
         return
@@ -1441,13 +1506,13 @@ async def gif_add(
     )
 
     await interaction.response.send_message(
-        f"🎬 Đã thêm GIF cho keyword `{keyword}`."
+        tr(interaction.guild.id, f"🎬 Added a GIF for keyword `{keyword}`.", f"🎬 Đã thêm GIF cho keyword `{keyword}`.")
     )
 
 
 @bot.tree.command(
     name="gif",
-    description="Gửi GIF từ thư viện server"
+    description="Send a GIF from the server library"
 )
 async def gif(
     interaction: discord.Interaction,
@@ -1460,7 +1525,7 @@ async def gif(
 
     if not urls:
         await interaction.response.send_message(
-            f"❌ Chưa có GIF cho `{keyword}`."
+            ftr(interaction.guild.id, f"❌ No GIF found for `{keyword}`.", f"❌ Chưa có GIF cho `{keyword}`.")
         )
         return
 
@@ -1471,7 +1536,7 @@ async def gif(
 
 @bot.tree.command(
     name="help",
-    description="Xem trợ giúp"
+    description="View help and commands"
 )
 async def help_command(interaction: discord.Interaction):
     await interaction.response.send_message(
@@ -1567,7 +1632,7 @@ async def support_prefix(ctx, *, message: str = "Người dùng yêu cầu hỗ 
     await ctx.send("✅ Đã gửi yêu cầu support." if ok else f"❌ {result}")
 
 
-@bot.tree.command(name="support", description="Gửi yêu cầu hỗ trợ đến kênh support.")
+@bot.tree.command(name="support", description="Send a support request to the support channel")
 async def support_slash(
     interaction: discord.Interaction,
     message: str = "Người dùng yêu cầu hỗ trợ.",
@@ -1604,7 +1669,7 @@ async def premium_prefix(ctx):
     await ctx.send(text)
 
 
-@bot.tree.command(name="premium", description="Xem gói Premium hiện tại của server.")
+@bot.tree.command(name="premium", description="View the server plan")
 async def premium_slash(interaction: discord.Interaction):
     if not interaction.guild:
         await interaction.response.send_message(
@@ -1838,7 +1903,7 @@ async def caption_prefix(ctx, *, text: str = ""):
     await _caption_from_prefix(ctx, text)
 
 
-@bot.tree.command(name="caption", description="Thêm một tầng nền trắng phía trên ảnh và ghi caption.")
+@bot.tree.command(name="caption", description="Add a white caption area above an image")
 @app_commands.describe(text="Dòng chữ cần ghi", image="Ảnh cần thêm caption")
 async def caption_slash(
     interaction: discord.Interaction,
@@ -1894,7 +1959,7 @@ async def avatar_prefix(ctx, target: discord.User = None):
     await _send_avatar(ctx, target)
 
 
-@bot.tree.command(name="avatar", description="Hiển thị avatar của bạn hoặc người được chọn.")
+@bot.tree.command(name="avatar", description="Show your avatar or a selected user avatar")
 @app_commands.describe(user="Người có avatar muốn xem (bỏ trống để xem avatar của bạn)")
 async def avatar_slash(interaction: discord.Interaction, user: discord.User | None = None):
     target = user or interaction.user
@@ -2002,17 +2067,17 @@ async def ai_memory_prefix(ctx):
 @commands.has_guild_permissions(manage_guild=True)
 async def genz_add_prefix(ctx, term: str, meaning: str, *, example: str = ""):
     save_genz_term(ctx.guild.id, term, meaning, example)
-    await ctx.send(f"🧠 Đã thêm `{term}` vào Gen Z dictionary.")
+    await ctx.send(tr(interaction.guild.id, f"🧠 Added `{term}` to the Gen Z dictionary.", f"🧠 Đã thêm `{term}` vào Gen Z dictionary."))
 
 
 @bot.command(name="gif_add")
 @commands.has_guild_permissions(manage_guild=True)
 async def gif_add_prefix(ctx, keyword: str, url: str):
     if not (url.startswith("https://") or url.startswith("http://")):
-        await ctx.send("❌ URL không hợp lệ.")
+        await ctx.send(tr(interaction.guild.id, "❌ Invalid URL.", "❌ URL không hợp lệ."))
         return
     add_gif(ctx.guild.id, keyword, url)
-    await ctx.send(f"🎬 Đã thêm GIF cho keyword `{keyword}`.")
+    await ctx.send(tr(interaction.guild.id, f"🎬 Added a GIF for keyword `{keyword}`.", f"🎬 Đã thêm GIF cho keyword `{keyword}`."))
 
 
 @bot.command(name="gif")
@@ -2031,14 +2096,14 @@ async def help_prefix(ctx):
         "`!ai_on` / `!ai_off` → bật/tắt AI\n"
         "`!ai_channel #channel` → chọn channel AI\n"
         "`!ai_interval <số>` → đặt interval\n"
-        "`!status` → trạng thái bot\n"
+        "`!status` → bot status\n"
         "`!ai_memory` → xem memory\n"
         "`!genz_add <term> <meaning> [example]` → thêm Gen Z\n"
         "`!gif_add <keyword> <url>` → thêm GIF\n"
         "`!gif <keyword>` → gửi GIF\n"
         "`!caption <chữ>` + ảnh → thêm nền trắng + chữ phía trên\n"
         "`!avatar` → xem avatar của bạn\n"        "`!avatar @user` → xem avatar của người được mention\n"
-        "`!support <nội dung>` → gửi support\n"
+        "`!support <message>` → send support\n"
         "`!premium` → xem gói server\n"
         "`!premium_add <server_id> <standard|premium>` → cấp gói (owner)\n"
         "`!premium_remove <server_id>` → về Free (owner)"
