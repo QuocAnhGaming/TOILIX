@@ -3,6 +3,7 @@ import random
 import sqlite3
 import asyncio
 import re
+import textwrap
 import requests
 from io import BytesIO
 
@@ -29,9 +30,9 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 SUPPORT_CHANNEL_ID = int(os.getenv("SUPPORT_CHANNEL_ID", "0") or 0)
 
-# FREE: giữ AI cũ của bot (Ollama).
-MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434/api/generate")
+# FREE: giữ AI cũ của bot (Gemini).
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite").strip()
 
 # STANDARD/PREMIUM: AI mới qua OpenAI. Đổi model bằng .env.
 STANDARD_MODEL = os.getenv("STANDARD_MODEL", "gpt-6-sol")
@@ -40,7 +41,7 @@ PREMIUM_MODEL = os.getenv("PREMIUM_MODEL", "gpt-6-astra")
 MIN_INTERVAL = 5
 MAX_INTERVAL = 15
 DEFAULT_INTERVAL = 6
-EARLY_REPLY_CHANCE = 0.25
+EARLY_REPLY_CHANCE = 0.10
 
 DB_FILE = os.getenv("DB_FILE", "memory.db")
 
@@ -168,9 +169,30 @@ def init_db():
         )
     """)
 
+    # Language is stored per channel. Migrate the old guild-level table safely.
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='language_settings'")
+    language_table_exists = cur.fetchone() is not None
+
+    if language_table_exists:
+        columns = [row[1] for row in cur.execute("PRAGMA table_info(language_settings)").fetchall()]
+        if "channel_id" not in columns:
+            # Keep the old data as a backup, but do not use guild_id to decide language.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS language_settings_legacy (
+                    guild_id INTEGER PRIMARY KEY,
+                    language TEXT NOT NULL DEFAULT 'en'
+                )
+            """)
+            cur.execute("""
+                INSERT OR REPLACE INTO language_settings_legacy (guild_id, language)
+                SELECT guild_id, language FROM language_settings
+            """)
+            cur.execute("DROP TABLE language_settings")
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS language_settings (
-            guild_id INTEGER PRIMARY KEY,
+            channel_id INTEGER PRIMARY KEY,
+            guild_id INTEGER NOT NULL,
             language TEXT NOT NULL DEFAULT 'en'
         )
     """)
@@ -230,7 +252,7 @@ def plan_model(guild_id):
     plan = get_plan(guild_id)
     if plan == PLAN_PREMIUM: return PREMIUM_MODEL
     if plan == PLAN_STANDARD: return STANDARD_MODEL
-    return MODEL
+    return GEMINI_MODEL
 
 def set_plan(guild_id, plan, expires_at=None, source="manual"):
     if plan not in PLAN_ORDER: raise ValueError("Invalid plan")
@@ -264,26 +286,42 @@ LANG_EN = "en"
 LANG_VI = "vi"
 LANGUAGE_LABELS = {LANG_EN: "English", LANG_VI: "Tiếng Việt"}
 
-def get_language(guild_id):
-    if not guild_id:
+def get_language(channel_id):
+    """Return the language configured for this channel. New channels default to English."""
+    if not channel_id:
         return LANG_EN
     conn = get_db()
-    row = conn.execute("SELECT language FROM language_settings WHERE guild_id = ?", (guild_id,)).fetchone()
+    row = conn.execute(
+        "SELECT language FROM language_settings WHERE channel_id = ?",
+        (channel_id,),
+    ).fetchone()
     conn.close()
     return row[0] if row and row[0] in (LANG_EN, LANG_VI) else LANG_EN
 
-def set_language(guild_id, language):
+
+def set_language(channel_id, guild_id, language):
+    """Set language only for one channel."""
     language = language if language in (LANG_EN, LANG_VI) else LANG_EN
     conn = get_db()
     conn.execute("""
-        INSERT INTO language_settings (guild_id, language) VALUES (?, ?)
-        ON CONFLICT(guild_id) DO UPDATE SET language = excluded.language
-    """, (guild_id, language))
+        INSERT INTO language_settings (channel_id, guild_id, language)
+        VALUES (?, ?, ?)
+        ON CONFLICT(channel_id) DO UPDATE SET
+            guild_id = excluded.guild_id,
+            language = excluded.language
+    """, (channel_id, guild_id, language))
     conn.commit()
     conn.close()
 
-def tr(guild_id, english, vietnamese):
-    return vietnamese if get_language(guild_id) == LANG_VI else english
+
+def tr(channel_id, english, vietnamese):
+    return vietnamese if get_language(channel_id) == LANG_VI else english
+
+
+def channel_id_of(obj):
+    if isinstance(obj, discord.Interaction):
+        return obj.channel.id if obj.channel else None
+    return getattr(getattr(obj, "channel", None), "id", None)
 
 
 # =========================================================
@@ -835,38 +873,93 @@ def get_gif_keywords(guild_id):
 
 # AI BACKENDS
 # =========================================================
-def ask_ollama(prompt):
+
+def ask_gemini(prompt):
+    """Free AI backend. Uses Gemini API through HTTPS; no Gemini/OpenAI required."""
+    if not GEMINI_API_KEY:
+        print("[GEMINI ERROR] GEMINI_API_KEY is missing.")
+        return None
+
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{GEMINI_MODEL}:generateContent"
+    )
+    payload = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": prompt}],
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.75,
+            "topP": 0.9,
+        },
+    }
+
     try:
         response = requests.post(
-            OLLAMA_URL,
-            json={"model": MODEL, "prompt": prompt, "stream": False, "options": {"temperature": 0.75, "top_p": 0.9}},
-            timeout=180,
+            url,
+            params={"key": GEMINI_API_KEY},
+            json=payload,
+            timeout=120,
         )
-        response.raise_for_status()
-        return response.json().get("response", "").strip()
-    except Exception as e:
-        print("[OLLAMA ERROR]", e)
+
+        if response.status_code != 200:
+            try:
+                detail = response.json().get("error", {}).get("message", response.text)
+            except Exception:
+                detail = response.text
+            print(f"[GEMINI ERROR] HTTP {response.status_code}: {detail}")
+            return None
+
+        data = response.json()
+        candidates = data.get("candidates") or []
+        if not candidates:
+            print("[GEMINI ERROR] No candidates returned:", data)
+            return None
+
+        parts = candidates[0].get("content", {}).get("parts", [])
+        answer = "".join(
+            part.get("text", "")
+            for part in parts
+            if isinstance(part, dict)
+        ).strip()
+
+        if not answer:
+            print("[GEMINI ERROR] Empty text returned:", data)
+            return None
+
+        return answer
+
+    except requests.RequestException as e:
+        print("[GEMINI ERROR] Network:", repr(e))
         return None
+    except Exception as e:
+        print("[GEMINI ERROR]", repr(e))
+        return None
+
 
 def ask_openai(prompt, model):
     if OPENAI_CLIENT is None:
-        print("[OPENAI ERROR] OPENAI_API_KEY hoặc package openai chưa được cấu hình.")
+        print("[OPENAI ERROR] OPENAI_API_KEY or package openai is not configured.")
         return None
     try:
-        response = OPENAI_CLIENT.responses.create(model=model, input=[{"role": "user", "content": prompt}])
+        response = OPENAI_CLIENT.responses.create(
+            model=model,
+            input=[{"role": "user", "content": prompt}],
+        )
         return (response.output_text or "").strip()
     except Exception as e:
         print("[OPENAI ERROR]", repr(e))
         return None
 
+
 async def ask_ai_async(guild_id, prompt):
     plan = get_plan(guild_id)
     if plan == PLAN_FREE:
-        return await asyncio.to_thread(ask_ollama, prompt)
+        return await asyncio.to_thread(ask_gemini, prompt)
     return await asyncio.to_thread(ask_openai, prompt, plan_model(guild_id))
-
-async def ask_ollama_async(prompt):
-    return await asyncio.to_thread(ask_ollama, prompt)
 
 # =========================================================
 # MESSAGE HELPERS
@@ -1117,7 +1210,7 @@ def build_ai_prompt(message):
     gif_memory = get_server_gif_memory(guild_id, limits["gifs"])
 
     current = clean_message_content(message)
-    language_name = LANGUAGE_LABELS.get(get_language(guild_id), "English")
+    language_name = LANGUAGE_LABELS.get(get_language(message.channel.id), "English")
 
     prompt = f"""
 Bạn là một Discord AI chatbot.
@@ -1128,8 +1221,9 @@ MỤC TIÊU:
 - Khi cần thì giải thích rõ.
 - Không bịa thông tin.
 - Không lặp lại chính mình.
-- Có thể nói tiếng Việt, tiếng Anh hoặc trộn hai ngôn ngữ
-  nếu phù hợp với cách nói của người dùng.
+- PHẢI trả lời CHỈ bằng {language_name}.
+- Không tự đổi ngôn ngữ theo ngôn ngữ người dùng.
+- Không trộn ngôn ngữ trừ khi một tên riêng, thuật ngữ hoặc đoạn mã bắt buộc phải giữ nguyên.
 
 VIBE:
 - Có thể dùng internet/Gen Z slang khi đúng ngữ cảnh.
@@ -1152,9 +1246,9 @@ GIF:
 Bot có bộ nhớ GIF được học trực tiếp từ GIF mà người dùng đã gửi trong server.
 
 {chr(10).join(
-    f"- GIF_ID={gid} | uses={uses} | context={ctx or "(không có text)"}"
+    f"- GIF_ID={gid} | uses={uses} | context={ctx or '(no text)'}"
     for gid, url, ctx, uses in gif_memory
-) if gif_memory else "(chưa học được GIF nào)"}
+) if gif_memory else "(no GIFs learned yet)"}
 
 Nếu thật sự phù hợp với tình huống, có thể kết thúc câu trả lời bằng:
 [SERVER_GIF]
@@ -1195,6 +1289,10 @@ Không dùng GIF trong mọi tin nhắn.
         prompt += "(chưa có)\n"
 
     prompt += f"""
+================ RESPONSE LANGUAGE ================
+Current channel language: {language_name}
+Reply ONLY in {language_name}.
+
 ================ CURRENT MESSAGE ================
 
 {message.author.display_name}: {current}
@@ -1266,10 +1364,10 @@ async def on_ready():
 
     print("=" * 55)
     print("DISCORD AI BOT ONLINE")
-    print(f"Free AI (Ollama): {MODEL}")
+    print(f"Free AI (Gemini): {GEMINI_MODEL}")
     print(f"Standard AI: {STANDARD_MODEL}")
     print(f"Premium AI: {PREMIUM_MODEL}")
-    print(f"OpenAI configured: {"YES" if openai_available() else "NO"}")
+    print(f"OpenAI configured: {'YES' if openai_available() else 'NO'}")
     print("Memory: ON")
     print("Self-learning: ON")
     print("Gen Z learning: ON")
@@ -1285,36 +1383,54 @@ async def on_ready():
 # SLASH COMMANDS
 # =========================================================
 
-@bot.tree.command(name="language", description="Choose the bot language for this server")
+@bot.tree.command(name="language", description="Choose the bot language for this channel")
 @app_commands.describe(language="Choose English or Vietnamese")
 @app_commands.choices(language=[
     app_commands.Choice(name="English", value="en"),
     app_commands.Choice(name="Tiếng Việt", value="vi"),
 ])
 async def language_command(interaction: discord.Interaction, language: app_commands.Choice[str]):
-    if not interaction.guild:
-        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+    if not interaction.guild or not interaction.channel:
+        await interaction.response.send_message(
+            "This command can only be used in a server." if not interaction.guild
+            else "Channel information is unavailable.",
+            ephemeral=True,
+        )
         return
-    set_language(interaction.guild.id, language.value)
+
+    set_language(interaction.channel.id, interaction.guild.id, language.value)
+
     if language.value == LANG_VI:
-        await interaction.response.send_message("🇻🇳 Đã chuyển ngôn ngữ bot sang Tiếng Việt.")
+        await interaction.response.send_message(
+            "🇻🇳 Đã chuyển ngôn ngữ bot sang Tiếng Việt cho channel này."
+        )
     else:
-        await interaction.response.send_message("🇬🇧 Bot language has been set to English.")
+        await interaction.response.send_message(
+            "🇬🇧 Bot language has been set to English for this channel."
+        )
+
 
 @bot.command(name="language")
 async def language_prefix(ctx, language: str = ""):
     if not ctx.guild:
         await ctx.send("This command can only be used in a server.")
         return
+
     value = language.lower().strip()
     if value in ("vi", "vietnamese", "tiengviet", "tiếng_việt"):
-        set_language(ctx.guild.id, LANG_VI)
-        await ctx.send("🇻🇳 Đã chuyển ngôn ngữ bot sang Tiếng Việt.")
+        set_language(ctx.channel.id, ctx.guild.id, LANG_VI)
+        await ctx.send("🇻🇳 Đã chuyển ngôn ngữ bot sang Tiếng Việt cho channel này.")
     elif value in ("en", "english"):
-        set_language(ctx.guild.id, LANG_EN)
-        await ctx.send("🇬🇧 Bot language has been set to English.")
+        set_language(ctx.channel.id, ctx.guild.id, LANG_EN)
+        await ctx.send("🇬🇧 Bot language has been set to English for this channel.")
     else:
-        await ctx.send("Use `!language en` or `!language vi`. You can also use `/language`.")
+        await ctx.send(
+            tr(
+                ctx.channel.id,
+                "Use `!language en` or `!language vi`.",
+                "Dùng `!language en` hoặc `!language vi`.",
+            )
+        )
 
 
 @bot.tree.command(name="ai_on", description="Enable the AI chatbot")
@@ -1329,7 +1445,7 @@ async def ai_on(interaction: discord.Interaction):
     save_settings(guild_id)
     seed_default_genz()
 
-    await interaction.response.send_message(tr(guild_id, "🤖 AI enabled.", "🤖 AI đã bật."))
+    await interaction.response.send_message(tr(interaction.channel.id if interaction.channel else 0, "🤖 AI enabled.", "🤖 AI đã bật."))
 
 
 @bot.tree.command(name="ai_off", description="Disable the AI chatbot")
@@ -1340,7 +1456,7 @@ async def ai_off(interaction: discord.Interaction):
     ai_enabled[guild_id] = False
     save_settings(guild_id)
 
-    await interaction.response.send_message(tr(guild_id, "🛑 AI disabled.", "🛑 AI đã tắt."))
+    await interaction.response.send_message(tr(interaction.channel.id if interaction.channel else 0, "🛑 AI disabled.", "🛑 AI đã tắt."))
 
 
 @bot.tree.command(
@@ -1357,7 +1473,7 @@ async def ai_channel(
     ai_channels[guild_id] = channel.id
     save_settings(guild_id)
 
-    await interaction.response.send_message(tr(guild_id, f"✅ AI is active in {channel.mention}", f"✅ AI hoạt động ở {channel.mention}"))
+    await interaction.response.send_message(tr(interaction.channel.id if interaction.channel else 0, f"✅ AI is active in {channel.mention}", f"✅ AI hoạt động ở {channel.mention}"))
 
 
 @bot.tree.command(
@@ -1373,7 +1489,11 @@ async def ai_interval(
     limits = get_tier_limits(guild_id)
     if not (limits["min_interval"] <= int(interval) <= limits["max_interval"]):
         await interaction.response.send_message(
-            f"❌ Gói {plan_label(get_plan(guild_id))} chỉ cho interval `{limits['min_interval']}-{limits['max_interval']}`.",
+            tr(
+                interaction.channel.id if interaction.channel else 0,
+                f"❌ The {plan_label(get_plan(guild_id))} plan only allows interval `{limits['min_interval']}-{limits['max_interval']}`.",
+                f"❌ Gói {plan_label(get_plan(guild_id))} chỉ cho interval `{limits['min_interval']}-{limits['max_interval']}`.",
+            ),
             ephemeral=True,
         )
         return
@@ -1382,45 +1502,53 @@ async def ai_interval(
     message_counts[guild_id] = 0
     save_settings(guild_id)
 
-    await interaction.response.send_message(tr(guild_id, f"✅ Interval = **{interval}**\n🎲 Early reply = **25%**", f"✅ Interval = **{interval}**\n🎲 Early reply = **25%**"))
+    await interaction.response.send_message(tr(interaction.channel.id if interaction.channel else 0, f"✅ Interval = **{interval}**\n🎲 Early reply = **10%**", f"✅ Interval = **{interval}**\n🎲 Early reply = **10%**"))
 
 
 @bot.tree.command(name="status", description="View AI status")
 async def status(interaction: discord.Interaction):
     guild_id = interaction.guild.id
+    channel_id = interaction.channel.id if interaction.channel else 0
 
     enabled = ai_enabled.get(guild_id, False)
-    channel_id = ai_channels.get(guild_id)
-    interval = reply_intervals.get(
-        guild_id,
-        DEFAULT_INTERVAL
-    )
+    channel_id_ai = ai_channels.get(guild_id)
+    interval = reply_intervals.get(guild_id, DEFAULT_INTERVAL)
 
     memory = get_message_count(guild_id)
     genz_count = len(get_genz_terms(guild_id, 1000))
     gif_count = len(get_gif_keywords(guild_id))
+    channel = interaction.guild.get_channel(channel_id_ai) if channel_id_ai else None
 
-    channel = (
-        interaction.guild.get_channel(channel_id)
-        if channel_id else None
-    )
+    if get_language(channel_id) == LANG_VI:
+        text = (
+            "**Trạng thái AI**\n\n"
+            f"Trạng thái: {'🟢 Bật' if enabled else '🔴 Tắt'}\n"
+            f"Channel AI: {channel.mention if channel else 'Chưa đặt'}\n"
+            f"Interval: {interval}\n"
+            f"Memory: {memory}\n"
+            f"Gen Z dictionary: {genz_count}\n"
+            f"GIF keywords: {gif_count}\n"
+            "Early reply: 10%\n"
+            "Direct mention: BẬT\n"
+            "Reply-to-bot: BẬT\n"
+            "Self-learning: BẬT"
+        )
+    else:
+        text = (
+            "**AI Status**\n\n"
+            f"Status: {'🟢 Enabled' if enabled else '🔴 Disabled'}\n"
+            f"AI channel: {channel.mention if channel else 'Not set'}\n"
+            f"Interval: {interval}\n"
+            f"Memory: {memory}\n"
+            f"Gen Z dictionary: {genz_count}\n"
+            f"GIF keywords: {gif_count}\n"
+            "Early reply: 10%\n"
+            "Direct mention: ON\n"
+            "Reply-to-bot: ON\n"
+            "Self-learning: ON"
+        )
 
-    await interaction.response.send_message(
-        f"""
-**AI Status**
-
-Trạng thái: {"🟢 Bật" if enabled else "🔴 Tắt"}
-Channel: {channel.mention if channel else "Chưa đặt"}
-Interval: {interval}
-Memory: {memory}
-Gen Z dictionary: {genz_count}
-GIF keywords: {gif_count}
-Early reply: 25%
-Direct mention: ON
-Reply-to-bot: ON
-Self-learning: ON
-"""
-    )
+    await interaction.response.send_message(text)
 
 
 @bot.tree.command(
@@ -1429,29 +1557,28 @@ Self-learning: ON
 )
 async def ai_memory(interaction: discord.Interaction):
     guild_id = interaction.guild.id
+    channel_id = interaction.channel.id if interaction.channel else 0
 
     summary = get_summary(guild_id)
     facts = get_facts(guild_id, 15)
     genz = get_genz_terms(guild_id, 15)
 
-    text = "🧠 **AI MEMORY**\n\n"
-
-    text += "**Summary:**\n"
-    text += (summary[:1200] if summary else "Chưa có.")
-
-    text += "\n\n**Facts:**\n"
-    if facts:
-        for username, fact in facts:
-            text += f"• {username}: {fact}\n"
+    if get_language(channel_id) == LANG_VI:
+        text = "🧠 **AI MEMORY**\n\n"
+        text += "**Summary:**\n"
+        text += summary[:1200] if summary else "Chưa có."
+        text += "\n\n**Facts:**\n"
+        text += "".join(f"• {username}: {fact}\n" for username, fact in facts) if facts else "Chưa có."
+        text += "\n**Gen Z:**\n"
+        text += "".join(f"• `{term}` = {meaning}\n" for term, meaning, _, _, _ in genz) if genz else "Chưa có."
     else:
-        text += "Chưa có."
-
-    text += "\n**Gen Z:**\n"
-    if genz:
-        for term, meaning, _, _, _ in genz:
-            text += f"• `{term}` = {meaning}\n"
-    else:
-        text += "Chưa có."
+        text = "🧠 **AI MEMORY**\n\n"
+        text += "**Summary:**\n"
+        text += summary[:1200] if summary else "None yet."
+        text += "\n\n**Facts:**\n"
+        text += "".join(f"• {username}: {fact}\n" for username, fact in facts) if facts else "None yet."
+        text += "\n**Gen Z:**\n"
+        text += "".join(f"• `{term}` = {meaning}\n" for term, meaning, _, _, _ in genz) if genz else "None yet."
 
     await interaction.response.send_message(text[:1900])
 
@@ -1475,7 +1602,7 @@ async def genz_add(
     )
 
     await interaction.response.send_message(
-        tr(interaction.guild.id, f"🧠 Added `{term}` to the Gen Z dictionary.", f"🧠 Đã thêm `{term}` vào Gen Z dictionary.")
+        tr(interaction.channel.id if interaction.channel else 0, f"🧠 Added `{term}` to the Gen Z dictionary.", f"🧠 Đã thêm `{term}` vào Gen Z dictionary.")
     )
 
 
@@ -1494,7 +1621,7 @@ async def gif_add(
         or url.startswith("http://")
     ):
         await interaction.response.send_message(
-            tr(interaction.guild.id, "❌ Invalid URL.", "❌ URL không hợp lệ."),
+            tr(interaction.channel.id if interaction.channel else 0, "❌ Invalid URL.", "❌ URL không hợp lệ."),
             ephemeral=True
         )
         return
@@ -1506,7 +1633,7 @@ async def gif_add(
     )
 
     await interaction.response.send_message(
-        tr(interaction.guild.id, f"🎬 Added a GIF for keyword `{keyword}`.", f"🎬 Đã thêm GIF cho keyword `{keyword}`.")
+        tr(interaction.channel.id if interaction.channel else 0, f"🎬 Added a GIF for keyword `{keyword}`.", f"🎬 Đã thêm GIF cho keyword `{keyword}`.")
     )
 
 
@@ -1525,7 +1652,7 @@ async def gif(
 
     if not urls:
         await interaction.response.send_message(
-            ftr(interaction.guild.id, f"❌ No GIF found for `{keyword}`.", f"❌ Chưa có GIF cho `{keyword}`.")
+            tr(interaction.channel.id, f"❌ No GIF found for `{keyword}`.", f"❌ Chưa có GIF cho `{keyword}`.")
         )
         return
 
@@ -1534,44 +1661,91 @@ async def gif(
     )
 
 
+def build_help_text(channel_id):
+    """Build a complete help page from the commands actually registered in the bot."""
+    is_vi = get_language(channel_id) == LANG_VI
+
+    descriptions = {
+        "help": ("View all available commands.", "Xem toàn bộ lệnh hiện có."),
+        "language": ("Set the language for this channel.", "Đặt ngôn ngữ cho channel này."),
+        "ai_on": ("Enable the AI chatbot.", "Bật chatbot AI."),
+        "ai_off": ("Disable the AI chatbot.", "Tắt chatbot AI."),
+        "ai_channel": ("Choose the channel where AI can reply.", "Chọn channel để AI trả lời."),
+        "ai_interval": ("Set how many messages AI waits before replying.", "Đặt số tin nhắn AI chờ trước khi trả lời."),
+        "status": ("View the current AI status.", "Xem trạng thái AI hiện tại."),
+        "ai_memory": ("View AI memory.", "Xem memory của AI."),
+        "genz_add": ("Add slang or memes to the Gen Z dictionary.", "Thêm slang hoặc meme vào từ điển Gen Z."),
+        "gif_add": ("Add a GIF URL to the server library.", "Thêm URL GIF vào thư viện server."),
+        "gif": ("Send a GIF from the server library.", "Gửi GIF từ thư viện server."),
+        "caption": ("Add a white caption area above an image.", "Thêm vùng trắng chứa caption phía trên ảnh."),
+        "avatar": ("Show your avatar or another user's avatar.", "Hiển thị avatar của bạn hoặc người dùng khác."),
+        "support": ("Send a support request.", "Gửi yêu cầu hỗ trợ."),
+        "premium": ("View the current server plan.", "Xem gói hiện tại của server."),
+        "premium_add": ("Bot owner: grant Standard or Premium to a server.", "Owner bot: cấp Standard hoặc Premium cho server."),
+        "premium_remove": ("Bot owner: return a server to Free.", "Owner bot: đưa server về Free."),
+    }
+
+    prefix_descriptions = {
+        "help": ("Show this complete command list.", "Hiển thị danh sách lệnh đầy đủ này."),
+        "language": ("Set the language for this channel.", "Đặt ngôn ngữ cho channel này."),
+        "ai_on": ("Enable the AI chatbot.", "Bật chatbot AI."),
+        "ai_off": ("Disable the AI chatbot.", "Tắt chatbot AI."),
+        "ai_channel": ("Choose the AI reply channel.", "Chọn channel AI trả lời."),
+        "ai_interval": ("Set the AI reply interval.", "Đặt khoảng cách tin nhắn AI trả lời."),
+        "status": ("View AI status.", "Xem trạng thái AI."),
+        "ai_memory": ("View AI memory.", "Xem memory của AI."),
+        "genz_add": ("Add slang to the Gen Z dictionary.", "Thêm slang vào từ điển Gen Z."),
+        "gif_add": ("Add a GIF URL.", "Thêm URL GIF."),
+        "gif": ("Send a GIF.", "Gửi GIF."),
+        "caption": ("Add a caption above an image.", "Thêm caption phía trên ảnh."),
+        "avatar": ("Show an avatar.", "Hiển thị avatar."),
+        "support": ("Send a support request.", "Gửi yêu cầu hỗ trợ."),
+        "premium": ("View the server plan.", "Xem gói server."),
+        "premium_add": ("Bot owner: grant Standard/Premium.", "Owner bot: cấp Standard/Premium."),
+        "premium_remove": ("Bot owner: return a server to Free.", "Owner bot: đưa server về Free."),
+    }
+
+    lines = []
+    # Slash commands: read the actual registered tree, so help cannot drift from the bot.
+    for command in sorted(bot.tree.get_commands(), key=lambda c: c.name):
+        en, vi = descriptions.get(
+            command.name,
+            (command.description or "Slash command.", command.description or "Lệnh slash."),
+        )
+        lines.append(f"`/{command.name}` → {vi if is_vi else en}")
+
+    # Prefix commands: read the actual registered commands too.
+    for command in sorted(bot.commands, key=lambda c: c.name):
+        en, vi = prefix_descriptions.get(
+            command.name,
+            (command.help or "Prefix command.", command.help or "Lệnh prefix."),
+        )
+        lines.append(f"`!{command.name}` → {vi if is_vi else en}")
+
+    title = "🤖 **TOILIX COMMANDS**" if not is_vi else "🤖 **CÁC LỆNH TOILIX**"
+    note = (
+        "\n\n🎲 Normal chat: replies after the selected interval, with a 10% chance to reply early."
+        if not is_vi else
+        "\n\n🎲 Chat thường: bot trả lời theo interval đã chọn, kèm 10% xác suất trả lời sớm."
+    )
+    return title + "\n\n" + "\n".join(lines) + note
+
+
+async def send_interaction_long_text(interaction: discord.Interaction, text: str):
+    """Send long command output without cutting the help page at Discord's message limit."""
+    chunks = [text[i:i + 1900] for i in range(0, len(text), 1900)] or [""]
+    await interaction.response.send_message(chunks[0])
+    for chunk in chunks[1:]:
+        await interaction.followup.send(chunk)
+
+
 @bot.tree.command(
     name="help",
-    description="View help and commands"
+    description="View all available commands"
 )
 async def help_command(interaction: discord.Interaction):
-    await interaction.response.send_message(
-        """
-🤖 **Discord AI**
-
-`/ai_on` → bật AI
-`/ai_off` → tắt AI
-`/ai_channel` → chọn channel
-`/ai_interval` → 5-15 tin
-`/status` → trạng thái
-`/ai_memory` → memory
-
-**Gen Z**
-`/genz_add` → thêm slang thủ công
-
-**GIF**
-`/gif_add` → thêm GIF URL
-`/gif` → gửi GIF
-
-AI tự học:
-• facts
-• Gen Z / internet slang
-• ngữ cảnh hội thoại
-• custom emote
-
-AI trả lời ngay khi:
-• @mention bot
-• Reply tin nhắn bot
-
-Chat bình thường:
-• interval
-• 25% early reply
-"""
-    )
+    text = build_help_text(interaction.channel.id if interaction.channel else 0)
+    await send_interaction_long_text(interaction, text)
 
 
 # =========================================================\n# PREFIX COMMANDS (!) + SUPPORT + PREMIUM
@@ -1581,55 +1755,87 @@ async def send_long_text(ctx, text):
     for i in range(0, len(text), 1900):
         await ctx.send(text[i:i+1900])
 
-async def send_support_request(user, guild, message_text, source):
+async def send_support_request(user, guild, message_text, source, channel_id=None):
     if not SUPPORT_CHANNEL_ID:
-        return False, "Chưa cấu hình SUPPORT_CHANNEL_ID trong .env."
+        return False, tr(
+            channel_id,
+            "Support is not configured. Set SUPPORT_CHANNEL_ID in .env.",
+            "Support chưa được cấu hình. Hãy đặt SUPPORT_CHANNEL_ID trong .env.",
+        )
 
     channel = bot.get_channel(SUPPORT_CHANNEL_ID)
     if channel is None:
         try:
             channel = await bot.fetch_channel(SUPPORT_CHANNEL_ID)
         except discord.NotFound:
-            return False, f"Không tìm thấy channel với ID {SUPPORT_CHANNEL_ID}. Hãy kiểm tra lại ID."
+            return False, tr(
+                channel_id,
+                f"Support channel ID {SUPPORT_CHANNEL_ID} was not found.",
+                f"Không tìm thấy support channel với ID {SUPPORT_CHANNEL_ID}.",
+            )
         except discord.Forbidden:
-            return False, "Discord không cho bot truy cập channel này. Kiểm tra quyền View Channel."
+            return False, tr(
+                channel_id,
+                "Discord denied access to the support channel. Check View Channel permission.",
+                "Discord không cho bot truy cập support channel. Hãy kiểm tra quyền View Channel.",
+            )
         except Exception as e:
             print("[SUPPORT FETCH ERROR]", repr(e))
-            return False, "Không thể truy cập support channel. Kiểm tra ID và quyền của bot."
+            return False, tr(
+                channel_id,
+                "Could not access the support channel. Check the ID and bot permissions.",
+                "Không thể truy cập support channel. Hãy kiểm tra ID và quyền của bot.",
+            )
 
-    # Hỗ trợ TextChannel, Thread và các channel/messageable khác có thể gửi tin.
     if channel is None or not hasattr(channel, "send"):
-        return False, f"ID {SUPPORT_CHANNEL_ID} không phải channel có thể gửi tin."
+        return False, tr(
+            channel_id,
+            f"ID {SUPPORT_CHANNEL_ID} is not a sendable channel.",
+            f"ID {SUPPORT_CHANNEL_ID} không phải channel có thể gửi tin.",
+        )
 
+    is_vi = get_language(channel_id) == LANG_VI
     embed = discord.Embed(
-        title="📩 Support Request",
-        description=(message_text or "Không có nội dung.")[:4000],
+        title="📩 Yêu cầu hỗ trợ" if is_vi else "📩 Support Request",
+        description=(message_text or ("Không có nội dung." if is_vi else "No message."))[:4000],
         timestamp=discord.utils.utcnow(),
     )
-    embed.add_field(name="User", value=f"{user} (`{user.id}`)", inline=False)
     embed.add_field(
-        name="Server",
-        value=f"{guild.name} (`{guild.id}`)" if guild else "DM",
+        name="Người dùng" if is_vi else "User",
+        value=f"{user} (`{user.id}`)",
         inline=False,
     )
-    embed.add_field(name="Source", value=source, inline=True)
+    embed.add_field(
+        name="Server",
+        value=f"{guild.name} (`{guild.id}`)" if guild else ("DM"),
+        inline=False,
+    )
+    embed.add_field(name="Nguồn" if is_vi else "Source", value=source, inline=True)
 
     try:
         await channel.send(embed=embed)
-        return True, "Đã gửi."
+        return True, tr(channel_id, "Sent.", "Đã gửi.")
     except discord.Forbidden:
-        return False, "Bot không có quyền gửi vào support channel."
+        return False, tr(
+            channel_id,
+            "The bot cannot send messages to the support channel.",
+            "Bot không có quyền gửi vào support channel.",
+        )
     except Exception as e:
         print("[SUPPORT ERROR]", repr(e))
-        return False, "Không thể gửi support request."
+        return False, tr(
+            channel_id,
+            "Could not send the support request.",
+            "Không thể gửi support request.",
+        )
 
 
 @bot.command(name="support")
 async def support_prefix(ctx, *, message: str = "Người dùng yêu cầu hỗ trợ."):
     ok, result = await send_support_request(
-        ctx.author, ctx.guild, message, "!support"
+        ctx.author, ctx.guild, message, "!support", ctx.channel.id
     )
-    await ctx.send("✅ Đã gửi yêu cầu support." if ok else f"❌ {result}")
+    await ctx.send(tr(ctx.channel.id, "✅ Support request sent." if ok else f"❌ {result}", "✅ Đã gửi yêu cầu support." if ok else f"❌ {result}"))
 
 
 @bot.tree.command(name="support", description="Send a support request to the support channel")
@@ -1638,10 +1844,14 @@ async def support_slash(
     message: str = "Người dùng yêu cầu hỗ trợ.",
 ):
     ok, result = await send_support_request(
-        interaction.user, interaction.guild, message, "/support"
+        interaction.user, interaction.guild, message, "/support", interaction.channel.id if interaction.channel else 0
     )
     await interaction.response.send_message(
-        "✅ Đã gửi yêu cầu support." if ok else f"❌ {result}",
+        tr(
+            interaction.channel.id if interaction.channel else 0,
+            "✅ Support request sent." if ok else f"❌ {result}",
+            "✅ Đã gửi yêu cầu support." if ok else f"❌ {result}",
+        ),
         ephemeral=True,
     )
 
@@ -1649,22 +1859,39 @@ async def support_slash(
 @bot.command(name="premium")
 async def premium_prefix(ctx):
     if not ctx.guild:
-        await ctx.send("❌ Lệnh này chỉ dùng trong server.")
+        await ctx.send("This command can only be used in a server.")
         return
 
     plan = get_plan(ctx.guild.id)
     info = get_plan_info(ctx.guild.id)
     lim = get_tier_limits(ctx.guild.id)
+    is_vi = get_language(ctx.channel.id) == LANG_VI
+    label = (
+        {PLAN_FREE: "🆓 Free", PLAN_STANDARD: "🔹 Standard", PLAN_PREMIUM: "💎 Premium"}
+        if not is_vi else
+        {PLAN_FREE: "🆓 Miễn phí", PLAN_STANDARD: "🔹 Standard", PLAN_PREMIUM: "💎 Premium"}
+    )[plan]
 
-    text = (
-        f"**{plan_label(plan)}**\n"
-        f"AI: `{plan_model(ctx.guild.id)}`\n"
-        f"Memory: `{lim['memory_trigger']} → {lim['memory_keep']}`\n"
-        f"Facts: `{lim['max_facts']}`\n"
-        f"Gen Z: `{lim['max_genz']}`"
-    )
-    if info.get("expires_at"):
-        text += f"\nExpires: `{info['expires_at']}`"
+    if is_vi:
+        text = (
+            f"**{label}**\n"
+            f"AI: `{plan_model(ctx.guild.id)}`\n"
+            f"Memory: `{lim['memory_trigger']} → {lim['memory_keep']}`\n"
+            f"Facts: `{lim['max_facts']}`\n"
+            f"Gen Z: `{lim['max_genz']}`"
+        )
+        if info.get("expires_at"):
+            text += f"\nHết hạn: `{info['expires_at']}`"
+    else:
+        text = (
+            f"**{label}**\n"
+            f"AI: `{plan_model(ctx.guild.id)}`\n"
+            f"Memory: `{lim['memory_trigger']} → {lim['memory_keep']}`\n"
+            f"Facts: `{lim['max_facts']}`\n"
+            f"Gen Z: `{lim['max_genz']}`"
+        )
+        if info.get("expires_at"):
+            text += f"\nExpires: `{info['expires_at']}`"
 
     await ctx.send(text)
 
@@ -1673,17 +1900,27 @@ async def premium_prefix(ctx):
 async def premium_slash(interaction: discord.Interaction):
     if not interaction.guild:
         await interaction.response.send_message(
-            "❌ Lệnh này chỉ dùng trong server.", ephemeral=True
+            "This command can only be used in a server.",
+            ephemeral=True,
         )
         return
 
-    plan = get_plan(interaction.guild.id)
-    info = get_plan_info(interaction.guild.id)
-    lim = get_tier_limits(interaction.guild.id)
+    guild_id = interaction.guild.id
+    channel_id = interaction.channel.id if interaction.channel else 0
+    plan = get_plan(guild_id)
+    info = get_plan_info(guild_id)
+    lim = get_tier_limits(guild_id)
+    is_vi = get_language(channel_id) == LANG_VI
 
-    embed = discord.Embed(title="💎 Premium Status")
-    embed.add_field(name="Plan", value=plan_label(plan), inline=True)
-    embed.add_field(name="AI", value=f"`{plan_model(interaction.guild.id)}`", inline=True)
+    embed = discord.Embed(
+        title="💎 Trạng thái Premium" if is_vi else "💎 Premium Status"
+    )
+    embed.add_field(
+        name="Gói" if is_vi else "Plan",
+        value=("🆓 Miễn phí" if is_vi and plan == PLAN_FREE else plan_label(plan)),
+        inline=True,
+    )
+    embed.add_field(name="AI", value=f"`{plan_model(guild_id)}`", inline=True)
     embed.add_field(
         name="Memory",
         value=f"`{lim['memory_trigger']} → {lim['memory_keep']}`",
@@ -1692,7 +1929,11 @@ async def premium_slash(interaction: discord.Interaction):
     embed.add_field(name="Facts", value=str(lim["max_facts"]), inline=True)
     embed.add_field(name="Gen Z", value=str(lim["max_genz"]), inline=True)
     if info.get("expires_at"):
-        embed.add_field(name="Expires", value=f"`{info['expires_at']}`", inline=False)
+        embed.add_field(
+            name="Hết hạn" if is_vi else "Expires",
+            value=f"`{info['expires_at']}`",
+            inline=False,
+        )
 
     await interaction.response.send_message(embed=embed)
 
@@ -1706,12 +1947,12 @@ def valid_plan(plan):
 async def premium_add_prefix(ctx, guild_id: int, plan: str):
     plan = plan.lower().strip()
     if not valid_plan(plan):
-        await ctx.send("❌ Plan phải là `standard` hoặc `premium`.")
+        await ctx.send(tr(ctx.channel.id, "❌ Plan must be `standard` or `premium`.", "❌ Plan phải là `standard` hoặc `premium`."))
         return
 
     set_plan(guild_id, plan, source="manual")
     await ctx.send(
-        f"✅ Đã cấp **{plan_label(plan)}** cho server `{guild_id}`."
+        tr(ctx.channel.id, f"✅ Granted **{plan_label(plan)}** to server `{guild_id}`.", f"✅ Đã cấp **{plan_label(plan)}** cho server `{guild_id}`.")
     )
 
 
@@ -1719,7 +1960,7 @@ async def premium_add_prefix(ctx, guild_id: int, plan: str):
 @commands.is_owner()
 async def premium_remove_prefix(ctx, guild_id: int):
     remove_plan(guild_id)
-    await ctx.send(f"✅ Đã đưa server `{guild_id}` về Free.")
+    await ctx.send(tr(ctx.channel.id, f"✅ Returned server `{guild_id}` to Free.", f"✅ Đã đưa server `{guild_id}` về Free."))
 
 
 @bot.tree.command(
@@ -1740,7 +1981,7 @@ async def premium_add_slash(
 ):
     if not await bot.is_owner(interaction.user):
         await interaction.response.send_message(
-            "❌ Chỉ owner bot mới dùng được.", ephemeral=True
+            tr(interaction.channel.id if interaction.channel else 0, "❌ Only the bot owner can use this.", "❌ Chỉ owner bot mới dùng được."), ephemeral=True
         )
         return
 
@@ -1748,13 +1989,13 @@ async def premium_add_slash(
         gid = int(guild_id)
     except ValueError:
         await interaction.response.send_message(
-            "❌ Guild ID phải là số.", ephemeral=True
+            tr(interaction.channel.id if interaction.channel else 0, "❌ Guild ID must be a number.", "❌ Guild ID phải là số."), ephemeral=True
         )
         return
 
     set_plan(gid, plan.value, source="manual")
     await interaction.response.send_message(
-        f"✅ Đã cấp **{plan_label(plan.value)}** cho server `{gid}`.",
+        tr(interaction.channel.id if interaction.channel else 0, f"✅ Granted **{plan_label(plan.value)}** to server `{gid}`.", f"✅ Đã cấp **{plan_label(plan.value)}** cho server `{gid}`."),
         ephemeral=True,
     )
 
@@ -1769,7 +2010,7 @@ async def premium_remove_slash(
 ):
     if not await bot.is_owner(interaction.user):
         await interaction.response.send_message(
-            "❌ Chỉ owner bot mới dùng được.", ephemeral=True
+            tr(interaction.channel.id if interaction.channel else 0, "❌ Only the bot owner can use this.", "❌ Chỉ owner bot mới dùng được."), ephemeral=True
         )
         return
 
@@ -1777,13 +2018,13 @@ async def premium_remove_slash(
         gid = int(guild_id)
     except ValueError:
         await interaction.response.send_message(
-            "❌ Guild ID phải là số.", ephemeral=True
+            tr(interaction.channel.id if interaction.channel else 0, "❌ Guild ID must be a number.", "❌ Guild ID phải là số."), ephemeral=True
         )
         return
 
     remove_plan(gid)
     await interaction.response.send_message(
-        f"✅ Đã đưa server `{gid}` về Free.",
+        tr(interaction.channel.id if interaction.channel else 0, f"✅ Returned server `{gid}` to Free.", f"✅ Đã đưa server `{gid}` về Free."),
         ephemeral=True,
     )
 
@@ -1838,39 +2079,85 @@ async def _get_image_bytes_from_message(message: discord.Message):
 
 
 async def _make_caption_image(image_bytes: bytes, text: str):
-    """Tạo ảnh với một dải nền trắng ở phía trên và chữ giữ nguyên nội dung."""
+    """Create an image with a white caption area above the original image."""
     def build():
         with Image.open(BytesIO(image_bytes)) as original:
-            # GIF -> lấy frame đầu để output ổn định.
+            # GIF -> first frame for stable PNG output.
             if getattr(original, "is_animated", False):
                 original.seek(0)
+
             img = original.convert("RGB")
             width, height = img.size
+            clean_text = " ".join(str(text).split())
 
-            # Tối đa 160px, tối thiểu 90px; tùy chiều cao ảnh.
-            band_h = max(90, min(160, int(height * 0.18)))
+            # Pick a font size that can wrap the caption without horizontal overflow.
+            font_size = max(18, min(64, int(max(90, height * 0.18) * 0.48)))
+            max_text_width = max(80, width - 40)
+
+            while True:
+                font = _find_font(font_size)
+                words = clean_text.split()
+                lines = []
+                current = ""
+
+                for word in words:
+                    candidate = word if not current else f"{current} {word}"
+                    bbox = ImageDraw.Draw(Image.new("RGB", (1, 1))).textbbox(
+                        (0, 0), candidate, font=font
+                    )
+                    if bbox[2] - bbox[0] <= max_text_width:
+                        current = candidate
+                    else:
+                        if current:
+                            lines.append(current)
+                        # Handle a single word longer than the available width.
+                        if ImageDraw.Draw(Image.new("RGB", (1, 1))).textbbox(
+                            (0, 0), word, font=font
+                        )[2] - ImageDraw.Draw(Image.new("RGB", (1, 1))).textbbox(
+                            (0, 0), word, font=font
+                        )[0] > max_text_width:
+                            piece = ""
+                            for char in word:
+                                candidate_piece = piece + char
+                                bbox_piece = ImageDraw.Draw(Image.new("RGB", (1, 1))).textbbox(
+                                    (0, 0), candidate_piece, font=font
+                                )
+                                if bbox_piece[2] - bbox_piece[0] <= max_text_width:
+                                    piece = candidate_piece
+                                else:
+                                    if piece:
+                                        lines.append(piece)
+                                    piece = char
+                            current = piece
+                        else:
+                            current = word
+
+                if current:
+                    lines.append(current)
+
+                # At smaller font sizes, more lines are acceptable.
+                line_bbox = font.getbbox("Ag")
+                line_h = max(1, line_bbox[3] - line_bbox[1])
+                required_h = len(lines) * (line_h + 8) + 32
+
+                if font_size <= 18 or required_h <= 400 or len(lines) <= 8:
+                    break
+                font_size -= 2
+
+            band_h = max(90, min(400, required_h))
             canvas = Image.new("RGB", (width, height + band_h), "white")
             canvas.paste(img, (0, band_h))
 
             draw = ImageDraw.Draw(canvas)
-            clean_text = str(text)
-            font_size = max(18, min(64, int(band_h * 0.48)))
+            total_text_h = len(lines) * (line_h + 8) - 8
+            y = max(12, (band_h - total_text_h) // 2)
 
-            # Thu nhỏ font để cố gắng giữ caption trên một dòng.
-            while font_size > 16:
-                font = _find_font(font_size)
-                bbox = draw.textbbox((0, 0), clean_text, font=font)
-                if bbox[2] - bbox[0] <= width - 40:
-                    break
-                font_size -= 2
-
-            font = _find_font(font_size)
-            bbox = draw.textbbox((0, 0), clean_text, font=font)
-            text_w = bbox[2] - bbox[0]
-            text_h = bbox[3] - bbox[1]
-            x = max(20, (width - text_w) // 2)
-            y = max(0, (band_h - text_h) // 2 - bbox[1])
-            draw.text((x, y), clean_text, fill="black", font=font)
+            for line in lines:
+                bbox = draw.textbbox((0, 0), line, font=font)
+                text_w = bbox[2] - bbox[0]
+                x = max(20, (width - text_w) // 2)
+                draw.text((x, y - bbox[1]), line, fill="black", font=font)
+                y += line_h + 8
 
             out = BytesIO()
             canvas.save(out, format="PNG", optimize=True)
@@ -1882,12 +2169,12 @@ async def _make_caption_image(image_bytes: bytes, text: str):
 
 async def _caption_from_prefix(ctx, text: str):
     if not text.strip():
-        await ctx.send("❌ Dùng: `!caption <chữ>` rồi đính kèm ảnh hoặc reply vào ảnh.")
+        await ctx.send(tr(ctx.channel.id, "❌ Use `!caption <text>` with an image or reply to an image.", "❌ Dùng `!caption <chữ>` rồi đính kèm ảnh hoặc reply vào ảnh."))
         return
 
     image_bytes, filename = await _get_image_bytes_from_message(ctx.message)
     if not image_bytes:
-        await ctx.send("❌ Hãy đính kèm ảnh với lệnh hoặc reply vào một tin nhắn có ảnh.")
+        await ctx.send(tr(ctx.channel.id, "❌ Attach an image to the command or reply to a message with an image.", "❌ Hãy đính kèm ảnh với lệnh hoặc reply vào một tin nhắn có ảnh."))
         return
 
     try:
@@ -1895,7 +2182,7 @@ async def _caption_from_prefix(ctx, text: str):
         await ctx.send(file=discord.File(BytesIO(result), filename="caption.png"))
     except Exception as e:
         print("[CAPTION ERROR]", repr(e))
-        await ctx.send("❌ Không thể tạo ảnh caption.")
+        await ctx.send(tr(ctx.channel.id, "❌ Could not create the caption image.", "❌ Không thể tạo ảnh caption."))
 
 
 @bot.command(name="caption")
@@ -1911,7 +2198,7 @@ async def caption_slash(
     image: discord.Attachment | None = None,
 ):
     if not text.strip():
-        await interaction.response.send_message("❌ Caption không được để trống.", ephemeral=True)
+        await interaction.response.send_message(tr(interaction.channel.id if interaction.channel else 0, "❌ Caption cannot be empty.", "❌ Caption không được để trống."), ephemeral=True)
         return
 
     image_bytes = None
@@ -1923,7 +2210,11 @@ async def caption_slash(
 
     if image_bytes is None:
         await interaction.response.send_message(
-            "❌ Hãy chọn ảnh ở ô `image`. Với prefix, có thể reply vào ảnh.",
+            tr(
+                interaction.channel.id if interaction.channel else 0,
+                "❌ Select an image in the `image` field. With prefix, you can reply to an image.",
+                "❌ Hãy chọn ảnh ở ô `image`. Với prefix, có thể reply vào ảnh.",
+            ),
             ephemeral=True,
         )
         return
@@ -1934,7 +2225,7 @@ async def caption_slash(
         await interaction.followup.send(file=discord.File(BytesIO(result), filename="caption.png"))
     except Exception as e:
         print("[CAPTION ERROR]", repr(e))
-        await interaction.followup.send("❌ Không thể tạo ảnh caption.")
+        await interaction.followup.send(tr(interaction.channel.id if interaction.channel else 0, "❌ Could not create the caption image.", "❌ Không thể tạo ảnh caption."))
 
 
 async def _send_avatar(ctx, target=None):
@@ -1943,7 +2234,7 @@ async def _send_avatar(ctx, target=None):
     try:
         avatar_url = user.display_avatar.url
         embed = discord.Embed(
-            title=f"🖼️ Avatar của {user.display_name}",
+            title=tr(ctx.channel.id, f"🖼️ Avatar of {user.display_name}", f"🖼️ Avatar của {user.display_name}"),
             color=discord.Color.blurple(),
         )
         embed.set_image(url=avatar_url)
@@ -1951,7 +2242,7 @@ async def _send_avatar(ctx, target=None):
         await ctx.send(embed=embed)
     except Exception as e:
         print("[AVATAR ERROR]", repr(e))
-        await ctx.send("❌ Không thể lấy avatar của người dùng này.")
+        await ctx.send(tr(ctx.channel.id, "❌ Could not get this user's avatar.", "❌ Không thể lấy avatar của người dùng này."))
 
 
 @bot.command(name="avatar")
@@ -1966,7 +2257,7 @@ async def avatar_slash(interaction: discord.Interaction, user: discord.User | No
     try:
         avatar_url = target.display_avatar.url
         embed = discord.Embed(
-            title=f"🖼️ Avatar của {target.display_name}",
+            title=tr(interaction.channel.id if interaction.channel else 0, f"🖼️ Avatar of {target.display_name}", f"🖼️ Avatar của {target.display_name}"),
             color=discord.Color.blurple(),
         )
         embed.set_image(url=avatar_url)
@@ -1974,7 +2265,7 @@ async def avatar_slash(interaction: discord.Interaction, user: discord.User | No
         await interaction.response.send_message(embed=embed)
     except Exception as e:
         print("[AVATAR ERROR]", repr(e))
-        await interaction.response.send_message("❌ Không thể lấy avatar của người dùng này.", ephemeral=True)
+        await interaction.response.send_message(tr(interaction.channel.id if interaction.channel else 0, "❌ Could not get this user's avatar.", "❌ Không thể lấy avatar của người dùng này."), ephemeral=True)
 
 
 # =========================================================
@@ -1990,7 +2281,7 @@ async def ai_on_prefix(ctx):
     message_counts[guild_id] = 0
     save_settings(guild_id)
     seed_default_genz()
-    await ctx.send("🤖 AI đã bật.")
+    await ctx.send(tr(ctx.channel.id, "🤖 AI enabled.", "🤖 AI đã bật."))
 
 
 @bot.command(name="ai_off")
@@ -1999,7 +2290,7 @@ async def ai_off_prefix(ctx):
     guild_id = ctx.guild.id
     ai_enabled[guild_id] = False
     save_settings(guild_id)
-    await ctx.send("🛑 AI đã tắt.")
+    await ctx.send(tr(ctx.channel.id, "🛑 AI disabled.", "🛑 AI đã tắt."))
 
 
 @bot.command(name="ai_channel")
@@ -2008,7 +2299,7 @@ async def ai_channel_prefix(ctx, channel: discord.TextChannel):
     guild_id = ctx.guild.id
     ai_channels[guild_id] = channel.id
     save_settings(guild_id)
-    await ctx.send(f"✅ AI hoạt động ở {channel.mention}")
+    await ctx.send(tr(ctx.channel.id, f"✅ AI is active in {channel.mention}", f"✅ AI hoạt động ở {channel.mention}"))
 
 
 @bot.command(name="ai_interval")
@@ -2018,48 +2309,74 @@ async def ai_interval_prefix(ctx, interval: int):
     limits = get_tier_limits(guild_id)
     if not (limits["min_interval"] <= interval <= limits["max_interval"]):
         await ctx.send(
-            f"❌ Gói {plan_label(get_plan(guild_id))} chỉ cho interval `"
-            f"{limits['min_interval']}-{limits['max_interval']}`."
+            tr(
+                ctx.channel.id,
+                f"❌ The {plan_label(get_plan(guild_id))} plan only allows interval `{limits['min_interval']}-{limits['max_interval']}`.",
+                f"❌ Gói {plan_label(get_plan(guild_id))} chỉ cho interval `{limits['min_interval']}-{limits['max_interval']}`.",
+            )
         )
         return
     reply_intervals[guild_id] = interval
     message_counts[guild_id] = 0
     save_settings(guild_id)
-    await ctx.send(f"✅ Interval = **{interval}**\n🎲 Early reply = **25%**")
+    await ctx.send(tr(ctx.channel.id, f"✅ Interval = **{interval}**\n🎲 Early reply = **10%**", f"✅ Interval = **{interval}**\n🎲 Early reply = **10%**"))
 
 
 @bot.command(name="status")
 async def status_prefix(ctx):
     guild_id = ctx.guild.id
+    channel_id = ctx.channel.id
     enabled = ai_enabled.get(guild_id, False)
-    channel_id = ai_channels.get(guild_id)
+    ai_channel_id = ai_channels.get(guild_id)
     interval = reply_intervals.get(guild_id, DEFAULT_INTERVAL)
     memory = get_message_count(guild_id)
     genz_count = len(get_genz_terms(guild_id, 1000))
     gif_count = len(get_gif_keywords(guild_id))
-    channel = ctx.guild.get_channel(channel_id) if channel_id else None
-    await ctx.send(
-        f"**AI Status**\n\n"
-        f"Trạng thái: {'🟢 Bật' if enabled else '🔴 Tắt'}\n"
-        f"Channel: {channel.mention if channel else 'Chưa đặt'}\n"
-        f"Interval: {interval}\nMemory: {memory}\n"
-        f"Gen Z dictionary: {genz_count}\nGIF keywords: {gif_count}\n"
-        f"Early reply: 25%\nDirect mention: ON\nReply-to-bot: ON\nSelf-learning: ON"
-    )
+    channel = ctx.guild.get_channel(ai_channel_id) if ai_channel_id else None
+
+    if get_language(channel_id) == LANG_VI:
+        text = (
+            "**Trạng thái AI**\n\n"
+            f"Trạng thái: {'🟢 Bật' if enabled else '🔴 Tắt'}\n"
+            f"Channel AI: {channel.mention if channel else 'Chưa đặt'}\n"
+            f"Interval: {interval}\nMemory: {memory}\n"
+            f"Gen Z dictionary: {genz_count}\nGIF keywords: {gif_count}\n"
+            "Early reply: 10%\nDirect mention: BẬT\nReply-to-bot: BẬT\nSelf-learning: BẬT"
+        )
+    else:
+        text = (
+            "**AI Status**\n\n"
+            f"Status: {'🟢 Enabled' if enabled else '🔴 Disabled'}\n"
+            f"AI channel: {channel.mention if channel else 'Not set'}\n"
+            f"Interval: {interval}\nMemory: {memory}\n"
+            f"Gen Z dictionary: {genz_count}\nGIF keywords: {gif_count}\n"
+            "Early reply: 10%\nDirect mention: ON\nReply-to-bot: ON\nSelf-learning: ON"
+        )
+    await ctx.send(text)
 
 
 @bot.command(name="ai_memory")
 async def ai_memory_prefix(ctx):
     guild_id = ctx.guild.id
+    channel_id = ctx.channel.id
     summary = get_summary(guild_id)
     facts = get_facts(guild_id, 15)
     genz = get_genz_terms(guild_id, 15)
-    text = "🧠 **AI MEMORY**\n\n**Summary:**\n"
-    text += summary[:1200] if summary else "Chưa có."
-    text += "\n\n**Facts:**\n"
-    text += "".join(f"• {username}: {fact}\n" for username, fact in facts) if facts else "Chưa có.\n"
-    text += "\n**Gen Z:**\n"
-    text += "".join(f"• `{term}` = {meaning}\n" for term, meaning, _, _, _ in genz) if genz else "Chưa có."
+
+    if get_language(channel_id) == LANG_VI:
+        text = "🧠 **AI MEMORY**\n\n**Summary:**\n"
+        text += summary[:1200] if summary else "Chưa có."
+        text += "\n\n**Facts:**\n"
+        text += "".join(f"• {username}: {fact}\n" for username, fact in facts) if facts else "Chưa có.\n"
+        text += "\n**Gen Z:**\n"
+        text += "".join(f"• `{term}` = {meaning}\n" for term, meaning, _, _, _ in genz) if genz else "Chưa có."
+    else:
+        text = "🧠 **AI MEMORY**\n\n**Summary:**\n"
+        text += summary[:1200] if summary else "None yet."
+        text += "\n\n**Facts:**\n"
+        text += "".join(f"• {username}: {fact}\n" for username, fact in facts) if facts else "None yet.\n"
+        text += "\n**Gen Z:**\n"
+        text += "".join(f"• `{term}` = {meaning}\n" for term, meaning, _, _, _ in genz) if genz else "None yet."
     await ctx.send(text[:1900])
 
 
@@ -2067,46 +2384,77 @@ async def ai_memory_prefix(ctx):
 @commands.has_guild_permissions(manage_guild=True)
 async def genz_add_prefix(ctx, term: str, meaning: str, *, example: str = ""):
     save_genz_term(ctx.guild.id, term, meaning, example)
-    await ctx.send(tr(interaction.guild.id, f"🧠 Added `{term}` to the Gen Z dictionary.", f"🧠 Đã thêm `{term}` vào Gen Z dictionary."))
+    await ctx.send(tr(ctx.channel.id, f"🧠 Added `{term}` to the Gen Z dictionary.", f"🧠 Đã thêm `{term}` vào Gen Z dictionary."))
 
 
 @bot.command(name="gif_add")
 @commands.has_guild_permissions(manage_guild=True)
 async def gif_add_prefix(ctx, keyword: str, url: str):
     if not (url.startswith("https://") or url.startswith("http://")):
-        await ctx.send(tr(interaction.guild.id, "❌ Invalid URL.", "❌ URL không hợp lệ."))
+        await ctx.send(tr(ctx.channel.id, "❌ Invalid URL.", "❌ URL không hợp lệ."))
         return
     add_gif(ctx.guild.id, keyword, url)
-    await ctx.send(tr(interaction.guild.id, f"🎬 Added a GIF for keyword `{keyword}`.", f"🎬 Đã thêm GIF cho keyword `{keyword}`."))
+    await ctx.send(tr(ctx.channel.id, f"🎬 Added a GIF for keyword `{keyword}`.", f"🎬 Đã thêm GIF cho keyword `{keyword}`."))
 
 
 @bot.command(name="gif")
 async def gif_prefix(ctx, *, keyword: str = ""):
     urls = get_gifs(ctx.guild.id, keyword)
     if not urls:
-        await ctx.send("❌ Không tìm thấy GIF cho keyword này.")
+        await ctx.send(tr(ctx.channel.id, "❌ No GIF found for this keyword.", "❌ Không tìm thấy GIF cho keyword này."))
         return
     await ctx.send(random.choice(urls))
 
 
 @bot.command(name="help")
 async def help_prefix(ctx):
+    text = build_help_text(ctx.channel.id)
+    await send_long_text(ctx, text)
+
+
+@bot.event
+async def on_command_error(ctx, error):
+    # Ignore command-not-found so normal chat is unaffected.
+    if isinstance(error, commands.CommandNotFound):
+        return
+
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send(
+            tr(
+                ctx.channel.id,
+                "❌ You need the Manage Server permission.",
+                "❌ Bạn cần quyền Quản lý Server.",
+            )
+        )
+        return
+
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(
+            tr(
+                ctx.channel.id,
+                f"❌ Missing argument: `{error.param.name}`.",
+                f"❌ Thiếu tham số: `{error.param.name}`.",
+            )
+        )
+        return
+
+    if isinstance(error, commands.BadArgument):
+        await ctx.send(
+            tr(
+                ctx.channel.id,
+                "❌ One or more arguments are invalid.",
+                "❌ Một hoặc nhiều tham số không hợp lệ.",
+            )
+        )
+        return
+
+    print("[PREFIX COMMAND ERROR]", repr(error))
     await ctx.send(
-        "**📖 BOT COMMANDS**\n\n"
-        "`!ai_on` / `!ai_off` → bật/tắt AI\n"
-        "`!ai_channel #channel` → chọn channel AI\n"
-        "`!ai_interval <số>` → đặt interval\n"
-        "`!status` → bot status\n"
-        "`!ai_memory` → xem memory\n"
-        "`!genz_add <term> <meaning> [example]` → thêm Gen Z\n"
-        "`!gif_add <keyword> <url>` → thêm GIF\n"
-        "`!gif <keyword>` → gửi GIF\n"
-        "`!caption <chữ>` + ảnh → thêm nền trắng + chữ phía trên\n"
-        "`!avatar` → xem avatar của bạn\n"        "`!avatar @user` → xem avatar của người được mention\n"
-        "`!support <message>` → send support\n"
-        "`!premium` → xem gói server\n"
-        "`!premium_add <server_id> <standard|premium>` → cấp gói (owner)\n"
-        "`!premium_remove <server_id>` → về Free (owner)"
+        tr(
+            ctx.channel.id,
+            "❌ The command could not be completed.",
+            "❌ Không thể thực hiện lệnh.",
+        )
     )
 
 
@@ -2192,7 +2540,11 @@ async def on_message(message: discord.Message):
 
         if not answer:
             await message.channel.send(
-                "⚠️ AI không trả về phản hồi. Hãy kiểm tra Ollama/OpenAI và .env."
+                tr(
+                    message.channel.id,
+                    "⚠️ Gemini did not return a response. Check GEMINI_API_KEY, the Gemini model, or the API quota.",
+                    "⚠️ Gemini không trả về phản hồi. Hãy kiểm tra GEMINI_API_KEY, model Gemini hoặc giới hạn API.",
+                )
             )
         else:
             await send_ai_response(
@@ -2220,7 +2572,11 @@ async def on_message(message: discord.Message):
 
         try:
             await message.channel.send(
-                "⚠️ Có lỗi khi xử lý AI."
+                tr(
+                    message.channel.id,
+                    "⚠️ An error occurred while processing AI.",
+                    "⚠️ Có lỗi khi xử lý AI.",
+                )
             )
         except Exception:
             pass
@@ -2233,20 +2589,45 @@ async def on_message(message: discord.Message):
 # =========================================================
 
 async def permission_error(interaction, error):
-    if isinstance(
-        error,
-        app_commands.errors.MissingPermissions
-    ):
+    if isinstance(error, app_commands.errors.MissingPermissions):
+        message = tr(
+            interaction.channel.id if interaction.channel else 0,
+            "❌ You need the Manage Server permission.",
+            "❌ Bạn cần quyền Quản lý Server.",
+        )
         if interaction.response.is_done():
-            await interaction.followup.send(
-                "❌ Bạn cần quyền Manage Server.",
-                ephemeral=True
-            )
+            await interaction.followup.send(message, ephemeral=True)
         else:
-            await interaction.response.send_message(
-                "❌ Bạn cần quyền Manage Server.",
-                ephemeral=True
-            )
+            await interaction.response.send_message(message, ephemeral=True)
+
+
+async def generic_app_command_error(interaction, error):
+    print("[COMMAND ERROR]", repr(error))
+    message = tr(
+        interaction.channel.id if interaction.channel else 0,
+        "❌ The command could not be completed. Check the arguments and bot permissions.",
+        "❌ Không thể thực hiện lệnh. Hãy kiểm tra tham số và quyền của bot.",
+    )
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
+
+
+for _command in (
+    status,
+    ai_memory,
+    language_command,
+    gif,
+    help_command,
+    support_slash,
+    premium_slash,
+    premium_add_slash,
+    premium_remove_slash,
+    caption_slash,
+    avatar_slash,
+):
+    _command.error(generic_app_command_error)
 
 
 ai_on.error(permission_error)
@@ -2262,7 +2643,7 @@ gif_add.error(permission_error)
 # =========================================================
 
 if not TOKEN:
-    print("❌ Không tìm thấy DISCORD_TOKEN trong .env")
+    print("❌ DISCORD_TOKEN is missing from .env")
 else:
     init_db()
     bot.run(TOKEN)
