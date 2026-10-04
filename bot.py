@@ -31,9 +31,21 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 SUPPORT_CHANNEL_ID = int(os.getenv("SUPPORT_CHANNEL_ID", "0") or 0)
 
-# FREE: giữ AI cũ của bot (Gemini).
+# FREE AI FALLBACK CHAIN
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b").strip()
+
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "").strip()
+MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "mistral-small-latest").strip()
+
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free").strip()
+
+COHERE_API_KEY = os.getenv("COHERE_API_KEY", "").strip()
+COHERE_MODEL = os.getenv("COHERE_MODEL", "command-r7b-12-2024").strip()
 
 # STANDARD/PREMIUM: AI mới qua OpenAI. Đổi model bằng .env.
 STANDARD_MODEL = os.getenv("STANDARD_MODEL", "gpt-6-sol")
@@ -47,7 +59,6 @@ EARLY_REPLY_CHANCE = 0.10
 DB_FILE = os.getenv("DB_FILE", "memory.db")
 
 MEMORY_TRIGGER = 270
-# Khi compact memory: giữ lại khoảng 1/4 số tin nhắn gần nhất.
 MEMORY_KEEP = 68
 MAX_LEARNED_FACTS = 100
 MAX_GENZ_TERMS = 300
@@ -915,26 +926,80 @@ def get_gif_keywords(guild_id):
 # AI BACKENDS
 # =========================================================
 
-def ask_gemini(prompt):
-    """Free AI backend. Uses Gemini API through HTTPS; no Gemini/OpenAI required."""
-    if not GEMINI_API_KEY:
-        print("[GEMINI ERROR] GEMINI_API_KEY is missing.")
+def _extract_openai_style_answer(data):
+    choices = data.get("choices") or []
+    if not choices:
         return None
+    message = choices[0].get("message") or {}
+    content = message.get("content", "")
+    if isinstance(content, list):
+        content = "".join(
+            item.get("text", "") for item in content
+            if isinstance(item, dict)
+        )
+    return str(content).strip() or None
+
+
+def _post_chat_completion(url, api_key, model, prompt, provider, headers=None):
+    if not api_key:
+        return None, False
+
+    request_headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    if headers:
+        request_headers.update(headers)
+
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.75,
+        "max_tokens": 500,
+    }
+
+    try:
+        response = requests.post(
+            url,
+            headers=request_headers,
+            json=payload,
+            timeout=60,
+        )
+        if response.status_code != 200:
+            if response.status_code in (401, 403, 429):
+                print(f"[{provider}] unavailable HTTP {response.status_code}; trying next AI.")
+            else:
+                print(f"[{provider}] HTTP {response.status_code}; trying next AI.")
+            return None, True
+
+        answer = _extract_openai_style_answer(response.json())
+        if not answer:
+            print(f"[{provider}] empty response; trying next AI.")
+            return None, True
+        return answer, False
+    except requests.RequestException:
+        print(f"[{provider}] network error; trying next AI.")
+        return None, True
+    except Exception as e:
+        print(f"[{provider}] error: {e!r}; trying next AI.")
+        return None, True
+
+
+def ask_gemini(prompt):
+    """Gemini Free backend. Returns (answer, failed) for fallback handling."""
+    if not GEMINI_API_KEY:
+        return None, False
 
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
         f"{GEMINI_MODEL}:generateContent"
     )
     payload = {
-        "contents": [
-            {
-                "role": "user",
-                "parts": [{"text": prompt}],
-            }
-        ],
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {
             "temperature": 0.75,
             "topP": 0.9,
+            "maxOutputTokens": 500,
         },
     }
 
@@ -943,22 +1008,20 @@ def ask_gemini(prompt):
             url,
             params={"key": GEMINI_API_KEY},
             json=payload,
-            timeout=120,
+            timeout=60,
         )
-
         if response.status_code != 200:
-            try:
-                detail = response.json().get("error", {}).get("message", response.text)
-            except Exception:
-                detail = response.text
-            print(f"[GEMINI ERROR] HTTP {response.status_code}: {detail}")
-            return None
+            if response.status_code in (401, 403, 429):
+                print(f"[GEMINI] HTTP {response.status_code}; trying next AI.")
+            else:
+                print(f"[GEMINI] HTTP {response.status_code}; trying next AI.")
+            return None, True
 
         data = response.json()
         candidates = data.get("candidates") or []
         if not candidates:
-            print("[GEMINI ERROR] No candidates returned:", data)
-            return None
+            print("[GEMINI] No usable candidate; trying next AI.")
+            return None, True
 
         parts = candidates[0].get("content", {}).get("parts", [])
         answer = "".join(
@@ -966,19 +1029,79 @@ def ask_gemini(prompt):
             for part in parts
             if isinstance(part, dict)
         ).strip()
-
         if not answer:
-            print("[GEMINI ERROR] Empty text returned:", data)
-            return None
-
-        return answer
-
-    except requests.RequestException as e:
-        print("[GEMINI ERROR] Network:", repr(e))
-        return None
+            print("[GEMINI] Empty response; trying next AI.")
+            return None, True
+        return answer, False
+    except requests.RequestException:
+        print("[GEMINI] Network error; trying next AI.")
+        return None, True
     except Exception as e:
-        print("[GEMINI ERROR]", repr(e))
-        return None
+        print(f"[GEMINI] Error: {e!r}; trying next AI.")
+        return None, True
+
+
+def ask_groq(prompt):
+    return _post_chat_completion(
+        "https://api.groq.com/openai/v1/chat/completions",
+        GROQ_API_KEY, GROQ_MODEL, prompt, "GROQ"
+    )
+
+
+def ask_mistral(prompt):
+    return _post_chat_completion(
+        "https://api.mistral.ai/v1/chat/completions",
+        MISTRAL_API_KEY, MISTRAL_MODEL, prompt, "MISTRAL"
+    )
+
+
+def ask_openrouter(prompt):
+    return _post_chat_completion(
+        "https://openrouter.ai/api/v1/chat/completions",
+        OPENROUTER_API_KEY, OPENROUTER_MODEL, prompt, "OPENROUTER",
+        {"HTTP-Referer": "https://discord.com", "X-Title": "TOILIX Discord Bot"}
+    )
+
+
+def ask_cohere(prompt):
+    if not COHERE_API_KEY:
+        return None, False
+
+    try:
+        response = requests.post(
+            "https://api.cohere.com/v2/chat",
+            headers={
+                "Authorization": f"Bearer {COHERE_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": COHERE_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.75,
+                "max_tokens": 500,
+            },
+            timeout=60,
+        )
+        if response.status_code != 200:
+            print(f"[COHERE] HTTP {response.status_code}; trying next AI.")
+            return None, True
+        data = response.json()
+        message = data.get("message") or {}
+        content = message.get("content") or []
+        answer = "".join(
+            item.get("text", "") for item in content
+            if isinstance(item, dict)
+        ).strip()
+        if not answer:
+            print("[COHERE] Empty response; trying next AI.")
+            return None, True
+        return answer, False
+    except requests.RequestException:
+        print("[COHERE] Network error; trying next AI.")
+        return None, True
+    except Exception as e:
+        print(f"[COHERE] Error: {e!r}; trying next AI.")
+        return None, True
 
 
 def ask_openai(prompt, model):
@@ -998,9 +1121,30 @@ def ask_openai(prompt, model):
 
 async def ask_ai_async(guild_id, prompt):
     plan = get_plan(guild_id)
-    if plan == PLAN_FREE:
-        return await asyncio.to_thread(ask_gemini, prompt)
-    return await asyncio.to_thread(ask_openai, prompt, plan_model(guild_id))
+    if plan != PLAN_FREE:
+        return await asyncio.to_thread(ask_openai, prompt, plan_model(guild_id))
+
+    # Free chain: shared prompt/memory, only the AI provider changes.
+    backends = (
+        ("Gemini", ask_gemini),
+        ("Groq", ask_groq),
+        ("Mistral", ask_mistral),
+        ("OpenRouter", ask_openrouter),
+        ("Cohere", ask_cohere),
+    )
+
+    for index, (name, backend) in enumerate(backends):
+        answer, failed = await asyncio.to_thread(backend, prompt)
+        if answer:
+            if index > 0:
+                print(f"[AI FALLBACK] Using {name} after earlier Free AI failed.")
+            return answer
+        if not failed:
+            # Missing key: silently skip this provider.
+            continue
+
+    print("[AI FALLBACK] All configured Free AI providers failed or are out of quota.")
+    return None
 
 # =========================================================
 # MESSAGE HELPERS
@@ -1128,8 +1272,8 @@ Chỉ trả về summary mới, ngắn gọn.
 
     new_summary = await ask_ai_async(guild_id, prompt)
 
-    # Chỉ xóa tin cũ sau khi Summary được tạo thành công.
-    # Nếu Gemini/OpenAI lỗi (ví dụ HTTP 429), giữ nguyên memory để tránh mất dữ liệu.
+    # Chỉ xóa tin cũ sau khi Summary tạo thành công.
+    # Nếu cả 5 AI đều hết quota/lỗi, giữ nguyên memory để không mất dữ liệu.
     if not new_summary:
         conn.close()
         print(f"[MEMORY] Summary failed; kept {len(rows)} old messages in {guild_id}/{channel_id}")
@@ -1148,7 +1292,7 @@ Chỉ trả về summary mới, ngắn gọn.
     conn.commit()
     conn.close()
 
-    print(f"[MEMORY] Compacted {len(rows)} messages in {guild_id}/{channel_id}; kept {count - len(rows)}")
+    print(f"[MEMORY] Compacted {len(rows)} messages in {guild_id}")
 
 
 # =========================================================
