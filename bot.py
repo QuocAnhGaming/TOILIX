@@ -32,6 +32,20 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 SUPPORT_CHANNEL_ID = int(os.getenv("SUPPORT_CHANNEL_ID", "0") or 0)
 BOT_OWNER_ID = 1013140093105623060
 
+# Auto role: only enabled for the configured main/original server.
+def _env_int(name: str) -> int:
+    value = os.getenv(name, "").strip()
+    if not value:
+        return 0
+    try:
+        return int(value)
+    except ValueError:
+        print(f"[CONFIG] {name} must be a numeric Discord ID.")
+        return 0
+
+AUTO_ROLE_GUILD_ID = _env_int("AUTO_ROLE_GUILD_ID")
+AUTO_ROLE_ID = _env_int("AUTO_ROLE_ID")
+
 # FREE: giữ AI cũ của bot (Gemini).
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
@@ -1475,6 +1489,42 @@ async def send_ai_response(message, answer):
 
 
 # =========================================================
+# AUTO ROLE
+# =========================================================
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    """Automatically grant the configured role in the configured main server."""
+    if member.bot:
+        return
+
+    if not AUTO_ROLE_GUILD_ID or not AUTO_ROLE_ID:
+        return
+
+    if member.guild.id != AUTO_ROLE_GUILD_ID:
+        return
+
+    role = member.guild.get_role(AUTO_ROLE_ID)
+    if role is None:
+        print(f"[AUTO ROLE] Role {AUTO_ROLE_ID} was not found in guild {member.guild.id}.")
+        return
+
+    if role in member.roles:
+        return
+
+    try:
+        await member.add_roles(role, reason="TOILIX Auto Role")
+        print(f"[AUTO ROLE] Added {role.name} to {member} ({member.id}).")
+    except discord.Forbidden:
+        print(
+            "[AUTO ROLE] Permission error. Make sure TOILIX has Manage Roles "
+            "and its highest role is above the target role."
+        )
+    except Exception as e:
+        print("[AUTO ROLE ERROR]", repr(e))
+
+
+# =========================================================
 # READY
 # =========================================================
 
@@ -1506,6 +1556,9 @@ async def on_ready():
     print("Gen Z learning: ON")
     print("Custom emote support: ON")
     print("GIF library: ON")
+    print(
+        f"Auto role: {'ON' if AUTO_ROLE_GUILD_ID and AUTO_ROLE_ID else 'OFF'}"
+    )
     print("Direct mention: ON")
     print("Reply-to-bot: ON")
     print(f"Interval: {MIN_INTERVAL}-{MAX_INTERVAL}")
