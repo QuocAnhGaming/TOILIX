@@ -1392,7 +1392,7 @@ Không dùng GIF trong mọi tin nhắn.
 """
 
     if facts:
-        for username, fact in facts:
+        for _, username, fact in facts:
             prompt += f"- {username}: {fact}\n"
     else:
         prompt += "(chưa có)\n"
@@ -1724,7 +1724,7 @@ async def ai_memory(interaction: discord.Interaction):
         text += "**Summary:**\n"
         text += summary[:1200] if summary else "Chưa có."
         text += "\n\n**Facts:**\n"
-        text += "".join(f"• {username}: {fact}\n" for username, fact in facts) if facts else "Chưa có."
+        text += "".join(f"• {username}: {fact}\n" for _, username, fact in facts) if facts else "Chưa có."
         text += "\n**Gen Z:**\n"
         text += "".join(f"• `{term}` = {meaning}\n" for term, meaning, _, _, _ in genz) if genz else "Chưa có."
     else:
@@ -1732,7 +1732,7 @@ async def ai_memory(interaction: discord.Interaction):
         text += "**Summary:**\n"
         text += summary[:1200] if summary else "None yet."
         text += "\n\n**Facts:**\n"
-        text += "".join(f"• {username}: {fact}\n" for username, fact in facts) if facts else "None yet."
+        text += "".join(f"• {username}: {fact}\n" for _, username, fact in facts) if facts else "None yet."
         text += "\n**Gen Z:**\n"
         text += "".join(f"• `{term}` = {meaning}\n" for term, meaning, _, _, _ in genz) if genz else "None yet."
 
@@ -2844,14 +2844,14 @@ async def ai_memory_prefix(ctx):
         text = "🧠 **AI MEMORY**\n\n**Summary:**\n"
         text += summary[:1200] if summary else "Chưa có."
         text += "\n\n**Facts:**\n"
-        text += "".join(f"• {username}: {fact}\n" for username, fact in facts) if facts else "Chưa có.\n"
+        text += "".join(f"• {username}: {fact}\n" for _, username, fact in facts) if facts else "Chưa có.\n"
         text += "\n**Gen Z:**\n"
         text += "".join(f"• `{term}` = {meaning}\n" for term, meaning, _, _, _ in genz) if genz else "Chưa có."
     else:
         text = "🧠 **AI MEMORY**\n\n**Summary:**\n"
         text += summary[:1200] if summary else "None yet."
         text += "\n\n**Facts:**\n"
-        text += "".join(f"• {username}: {fact}\n" for username, fact in facts) if facts else "None yet.\n"
+        text += "".join(f"• {username}: {fact}\n" for _, username, fact in facts) if facts else "None yet.\n"
         text += "\n**Gen Z:**\n"
         text += "".join(f"• `{term}` = {meaning}\n" for term, meaning, _, _, _ in genz) if genz else "None yet."
     await ctx.send(text[:1900])
