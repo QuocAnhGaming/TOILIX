@@ -5,6 +5,7 @@ import asyncio
 import re
 import textwrap
 import requests
+from datetime import datetime, timezone, timedelta
 from io import BytesIO
 
 from PIL import Image, ImageDraw, ImageFont
@@ -77,6 +78,7 @@ ai_channels = {}
 reply_intervals = {}
 message_counts = {}
 learning_tasks = {}
+temporary_ban_tasks = {}
 
 
 # =========================================================
@@ -204,6 +206,17 @@ def init_db():
             expires_at TEXT,
             source TEXT DEFAULT 'manual',
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # Temporary bans are persisted so they survive bot restarts.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS temporary_bans (
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            expires_at REAL NOT NULL,
+            reason TEXT,
+            PRIMARY KEY (guild_id, user_id)
         )
     """)
 
@@ -1354,6 +1367,10 @@ async def on_ready():
     init_db()
     load_settings()
     seed_default_genz()
+    try:
+        await restore_temporary_bans()
+    except Exception as e:
+        print("[TEMP BAN RESTORE ERROR]", repr(e))
 
     try:
         # Sync global commands. Discord may take some time to propagate global commands.
@@ -1461,19 +1478,43 @@ async def ai_off(interaction: discord.Interaction):
 
 @bot.tree.command(
     name="ai_channel",
-    description="Choose the channel where AI can reply"
+    description="Enable or disable AI for a selected channel"
+)
+@app_commands.describe(
+    channel="The channel AI should use",
+    enabled="True = AI replies here, False = AI stays disabled here"
 )
 @app_commands.checks.has_permissions(manage_guild=True)
 async def ai_channel(
     interaction: discord.Interaction,
-    channel: discord.TextChannel
+    channel: discord.TextChannel,
+    enabled: bool
 ):
     guild_id = interaction.guild.id
 
+    # Always remember the selected channel. False only disables AI replies.
     ai_channels[guild_id] = channel.id
+    ai_enabled[guild_id] = enabled
+    if enabled:
+        reply_intervals.setdefault(guild_id, DEFAULT_INTERVAL)
+        message_counts[guild_id] = 0
+
     save_settings(guild_id)
 
-    await interaction.response.send_message(tr(interaction.channel.id if interaction.channel else 0, f"✅ AI is active in {channel.mention}", f"✅ AI hoạt động ở {channel.mention}"))
+    if enabled:
+        message = tr(
+            interaction.channel.id if interaction.channel else 0,
+            f"✅ AI enabled in {channel.mention}.",
+            f"✅ AI đã bật ở {channel.mention}."
+        )
+    else:
+        message = tr(
+            interaction.channel.id if interaction.channel else 0,
+            f"🛑 AI disabled in {channel.mention}. The channel is still saved and can be enabled again with `true`.",
+            f"🛑 AI đã tắt ở {channel.mention}. Kênh vẫn được lưu và có thể bật lại bằng `true`."
+        )
+
+    await interaction.response.send_message(message)
 
 
 @bot.tree.command(
@@ -1661,82 +1702,93 @@ async def gif(
     )
 
 
-def build_help_text(channel_id):
-    """Build a complete help page from the commands actually registered in the bot."""
+def build_help_embed(channel_id):
+    """Build an Owo-style command-list embed with / and ! shown together."""
     is_vi = get_language(channel_id) == LANG_VI
 
-    descriptions = {
-        "help": ("View all available commands.", "Xem toàn bộ lệnh hiện có."),
-        "language": ("Set the language for this channel.", "Đặt ngôn ngữ cho channel này."),
-        "ai_on": ("Enable the AI chatbot.", "Bật chatbot AI."),
-        "ai_off": ("Disable the AI chatbot.", "Tắt chatbot AI."),
-        "ai_channel": ("Choose the channel where AI can reply.", "Chọn channel để AI trả lời."),
-        "ai_interval": ("Set how many messages AI waits before replying.", "Đặt số tin nhắn AI chờ trước khi trả lời."),
-        "status": ("View the current AI status.", "Xem trạng thái AI hiện tại."),
-        "ai_memory": ("View AI memory.", "Xem memory của AI."),
-        "genz_add": ("Add slang or memes to the Gen Z dictionary.", "Thêm slang hoặc meme vào từ điển Gen Z."),
-        "gif_add": ("Add a GIF URL to the server library.", "Thêm URL GIF vào thư viện server."),
-        "gif": ("Send a GIF from the server library.", "Gửi GIF từ thư viện server."),
-        "caption": ("Add a white caption area above an image.", "Thêm vùng trắng chứa caption phía trên ảnh."),
-        "avatar": ("Show your avatar or another user's avatar.", "Hiển thị avatar của bạn hoặc người dùng khác."),
-        "support": ("Send a support request.", "Gửi yêu cầu hỗ trợ."),
-        "premium": ("View the current server plan.", "Xem gói hiện tại của server."),
-        "premium_add": ("Bot owner: grant Standard or Premium to a server.", "Owner bot: cấp Standard hoặc Premium cho server."),
-        "premium_remove": ("Bot owner: return a server to Free.", "Owner bot: đưa server về Free."),
+    # Only show commands that are actually registered in the bot.
+    command_names = {c.name for c in bot.tree.get_commands()}
+    command_names.update(c.name for c in bot.commands)
+
+    groups = {
+        ("🤖 AI", "🤖 AI"): [
+            "help", "language", "ai_on", "ai_off", "ai_channel",
+            "ai_interval", "status", "ai_memory",
+        ],
+        ("🛡️ Moderation", "🛡️ Quản trị"): ["mute", "ban"],
+        ("🎨 Media", "🎨 Media"): ["caption", "avatar", "gif", "gif_add"],
+        ("🧠 Learning", "🧠 Học tập"): ["genz_add"],
+        ("💎 Premium", "💎 Premium"): [
+            "premium", "premium_add", "premium_remove",
+        ],
+        ("🛠️ Utility", "🛠️ Tiện ích"): ["support"],
     }
 
-    prefix_descriptions = {
-        "help": ("Show this complete command list.", "Hiển thị danh sách lệnh đầy đủ này."),
-        "language": ("Set the language for this channel.", "Đặt ngôn ngữ cho channel này."),
-        "ai_on": ("Enable the AI chatbot.", "Bật chatbot AI."),
-        "ai_off": ("Disable the AI chatbot.", "Tắt chatbot AI."),
-        "ai_channel": ("Choose the AI reply channel.", "Chọn channel AI trả lời."),
-        "ai_interval": ("Set the AI reply interval.", "Đặt khoảng cách tin nhắn AI trả lời."),
-        "status": ("View AI status.", "Xem trạng thái AI."),
-        "ai_memory": ("View AI memory.", "Xem memory của AI."),
-        "genz_add": ("Add slang to the Gen Z dictionary.", "Thêm slang vào từ điển Gen Z."),
-        "gif_add": ("Add a GIF URL.", "Thêm URL GIF."),
-        "gif": ("Send a GIF.", "Gửi GIF."),
-        "caption": ("Add a caption above an image.", "Thêm caption phía trên ảnh."),
-        "avatar": ("Show an avatar.", "Hiển thị avatar."),
-        "support": ("Send a support request.", "Gửi yêu cầu hỗ trợ."),
-        "premium": ("View the server plan.", "Xem gói server."),
-        "premium_add": ("Bot owner: grant Standard/Premium.", "Owner bot: cấp Standard/Premium."),
-        "premium_remove": ("Bot owner: return a server to Free.", "Owner bot: đưa server về Free."),
-    }
-
-    lines = []
-    # Slash commands: read the actual registered tree, so help cannot drift from the bot.
-    for command in sorted(bot.tree.get_commands(), key=lambda c: c.name):
-        en, vi = descriptions.get(
-            command.name,
-            (command.description or "Slash command.", command.description or "Lệnh slash."),
-        )
-        lines.append(f"`/{command.name}` → {vi if is_vi else en}")
-
-    # Prefix commands: read the actual registered commands too.
-    for command in sorted(bot.commands, key=lambda c: c.name):
-        en, vi = prefix_descriptions.get(
-            command.name,
-            (command.help or "Prefix command.", command.help or "Lệnh prefix."),
-        )
-        lines.append(f"`!{command.name}` → {vi if is_vi else en}")
-
-    title = "🤖 **TOILIX COMMANDS**" if not is_vi else "🤖 **CÁC LỆNH TOILIX**"
-    note = (
-        "\n\n🎲 Normal chat: replies after the selected interval, with a 10% chance to reply early."
-        if not is_vi else
-        "\n\n🎲 Chat thường: bot trả lời theo interval đã chọn, kèm 10% xác suất trả lời sớm."
+    # Keep the embed close to the clean Owo command-list style:
+    # one category per field, commands rendered as compact Discord code chips.
+    # One clean Discord embed = the outer "box".
+    # Blurple matches the Discord/Owo-style colored left border.
+    embed = discord.Embed(
+        description=(
+            "Here is the list of commands!\n"
+            "Commands can be used with either `/` or `!`.\n"
+            "Need more help? Use `/support`."
+            if not is_vi else
+            "Đây là danh sách các lệnh!\n"
+            "Các lệnh có thể dùng bằng cả `/` và `!`.\n"
+            "Cần hỗ trợ thêm? Dùng `/support`."
+        ),
+        color=discord.Color.from_rgb(88, 101, 242),
     )
-    return title + "\n\n" + "\n".join(lines) + note
+
+    # Owo-style header: bot avatar + Command List inside the same box.
+    if bot.user:
+        embed.set_author(
+            name="Command List",
+            icon_url=bot.user.display_avatar.url,
+        )
+    else:
+        embed.set_author(name="Command List")
+
+    for (en_name, vi_name), names in groups.items():
+        visible = [name for name in names if name in command_names]
+        if not visible:
+            continue
+
+        # Put / and ! for the same command together, like a single command chip pair.
+        chips = []
+        for name in visible:
+            chips.append(f"`/{name}` `!{name}`")
+
+        embed.add_field(
+            name=vi_name if is_vi else en_name,
+            value=" ".join(chips),
+            inline=False,
+        )
+
+    embed.add_field(
+        name="⏱️ Duration" if not is_vi else "⏱️ Thời gian",
+        value=(
+            "`10s` `10m` `10d` • Mute/Ban also support `10d10m10s`."
+            if not is_vi else
+            "`10s` `10m` `10d` • Mute/Ban cũng hỗ trợ `10d10m10s`."
+        ),
+        inline=False,
+    )
+
+    embed.set_footer(
+        text=(
+            "TOILIX • AI has a 10% chance to reply early."
+            if not is_vi else
+            "TOILIX • AI có 10% xác suất trả lời sớm."
+        )
+    )
+    return embed
 
 
-async def send_interaction_long_text(interaction: discord.Interaction, text: str):
-    """Send long command output without cutting the help page at Discord's message limit."""
-    chunks = [text[i:i + 1900] for i in range(0, len(text), 1900)] or [""]
-    await interaction.response.send_message(chunks[0])
-    for chunk in chunks[1:]:
-        await interaction.followup.send(chunk)
+async def send_help_embed(target):
+    embed = build_help_embed(target.channel.id)
+    await target.send(embed=embed)
 
 
 @bot.tree.command(
@@ -1744,8 +1796,9 @@ async def send_interaction_long_text(interaction: discord.Interaction, text: str
     description="View all available commands"
 )
 async def help_command(interaction: discord.Interaction):
-    text = build_help_text(interaction.channel.id if interaction.channel else 0)
-    await send_interaction_long_text(interaction, text)
+    await interaction.response.send_message(
+        embed=build_help_embed(interaction.channel.id if interaction.channel else 0)
+    )
 
 
 # =========================================================\n# PREFIX COMMANDS (!) + SUPPORT + PREMIUM
@@ -2029,6 +2082,295 @@ async def premium_remove_slash(
     )
 
 
+
+# =========================================================
+# MODERATION: MUTE + TEMPORARY BAN
+# =========================================================
+
+DURATION_RE = re.compile(r"(?P<value>\d+)\s*(?P<unit>[smd])", re.IGNORECASE)
+MAX_TIMEOUT_SECONDS = 28 * 24 * 60 * 60
+
+
+def parse_duration(value: str):
+    """Parse durations such as 10s, 10m, 10d, or 10d10m10s."""
+    if not value:
+        return None
+
+    compact = re.sub(r"\s+", "", value.strip().lower())
+    matches = list(DURATION_RE.finditer(compact))
+
+    if not matches or "".join(m.group(0) for m in matches) != compact:
+        return None
+
+    total = 0
+    for match in matches:
+        amount = int(match.group("value"))
+        unit = match.group("unit").lower()
+        if unit == "s":
+            total += amount
+        elif unit == "m":
+            total += amount * 60
+        elif unit == "d":
+            total += amount * 86400
+
+    return total if total > 0 else None
+
+
+def format_duration(seconds: int):
+    seconds = int(seconds)
+    days, seconds = divmod(seconds, 86400)
+    minutes, seconds = divmod(seconds, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if minutes:
+        parts.append(f"{minutes}m")
+    if seconds or not parts:
+        parts.append(f"{seconds}s")
+    return "".join(parts)
+
+
+def save_temporary_ban(guild_id: int, user_id: int, expires_at: float, reason: str = ""):
+    conn = get_db()
+    conn.execute("""
+        INSERT INTO temporary_bans (guild_id, user_id, expires_at, reason)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(guild_id, user_id) DO UPDATE SET
+            expires_at = excluded.expires_at,
+            reason = excluded.reason
+    """, (guild_id, user_id, expires_at, reason))
+    conn.commit()
+    conn.close()
+
+
+def get_temporary_ban(guild_id: int, user_id: int):
+    conn = get_db()
+    row = conn.execute(
+        "SELECT expires_at, reason FROM temporary_bans WHERE guild_id = ? AND user_id = ?",
+        (guild_id, user_id)
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def remove_temporary_ban(guild_id: int, user_id: int):
+    conn = get_db()
+    conn.execute(
+        "DELETE FROM temporary_bans WHERE guild_id = ? AND user_id = ?",
+        (guild_id, user_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+async def temporary_unban(guild_id: int, user_id: int, expires_at: float):
+    delay = max(0, expires_at - __import__("time").time())
+    await asyncio.sleep(delay)
+
+    current = get_temporary_ban(guild_id, user_id)
+    if not current:
+        return
+
+    # A newer / extended ban replaced this timer.
+    if abs(float(current[0]) - float(expires_at)) > 0.5:
+        return
+
+    guild = bot.get_guild(guild_id)
+    if guild is None:
+        remove_temporary_ban(guild_id, user_id)
+        return
+
+    try:
+        await guild.unban(discord.Object(id=user_id), reason="Temporary ban expired")
+    except discord.NotFound:
+        pass
+    except discord.Forbidden:
+        print(f"[TEMP BAN] Cannot unban {user_id} in guild {guild_id}")
+        return
+    except Exception as e:
+        print(f"[TEMP BAN] Unban error: {e}")
+        return
+
+    remove_temporary_ban(guild_id, user_id)
+    temporary_ban_tasks.pop((guild_id, user_id), None)
+
+
+def schedule_temporary_unban(guild_id: int, user_id: int, expires_at: float):
+    key = (guild_id, user_id)
+    old_task = temporary_ban_tasks.get(key)
+    if old_task and not old_task.done():
+        old_task.cancel()
+
+    task = asyncio.create_task(temporary_unban(guild_id, user_id, expires_at))
+    temporary_ban_tasks[key] = task
+
+
+async def restore_temporary_bans():
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT guild_id, user_id, expires_at FROM temporary_bans"
+    ).fetchall()
+    conn.close()
+
+    now = __import__("time").time()
+    for guild_id, user_id, expires_at in rows:
+        if float(expires_at) <= now:
+            guild = bot.get_guild(guild_id)
+            if guild:
+                try:
+                    await guild.unban(
+                        discord.Object(id=user_id),
+                        reason="Temporary ban expired while bot was offline"
+                    )
+                except (discord.NotFound, discord.Forbidden):
+                    pass
+            remove_temporary_ban(guild_id, user_id)
+        else:
+            schedule_temporary_unban(guild_id, user_id, float(expires_at))
+
+
+async def _mute_member(member: discord.Member, duration_text: str, reason: str, channel_id: int):
+    seconds = parse_duration(duration_text)
+    if seconds is None:
+        return False, tr(
+            channel_id,
+            "❌ Invalid duration. Use `s`, `m`, `d`, for example `10d10m10s`.",
+            "❌ Thời gian không hợp lệ. Dùng `s`, `m`, `d`, ví dụ `10d10m10s`."
+        )
+
+    now = datetime.now(timezone.utc)
+    existing = member.timed_out_until
+    base = existing if existing and existing > now else now
+    until = base + timedelta(seconds=seconds)
+
+    # Discord timeout cannot be longer than 28 days from now.
+    if until > now + timedelta(seconds=MAX_TIMEOUT_SECONDS):
+        return False, tr(
+            channel_id,
+            "❌ The resulting timeout cannot exceed Discord's 28-day limit.",
+            "❌ Thời gian mute cuối cùng không được vượt quá giới hạn 28 ngày của Discord."
+        )
+
+    try:
+        await member.timeout(until, reason=reason or "Muted by moderator")
+    except discord.Forbidden:
+        return False, tr(
+            channel_id,
+            "❌ I cannot mute this member. Check my Moderate Members permission and role position.",
+            "❌ Bot không thể mute thành viên này. Hãy kiểm tra quyền Moderate Members và vị trí role của bot."
+        )
+    except Exception as e:
+        print("[MUTE ERROR]", repr(e))
+        return False, tr(channel_id, "❌ Could not mute this member.", "❌ Không thể mute thành viên này.")
+
+    return True, tr(
+        channel_id,
+        f"🔇 {member.mention} muted for `{format_duration(seconds)}`.",
+        f"🔇 Đã mute {member.mention} trong `{format_duration(seconds)}`."
+    )
+
+
+async def _ban_member(guild: discord.Guild, user_id: int, duration_text: str, reason: str, channel_id: int, member=None):
+    seconds = parse_duration(duration_text)
+    if seconds is None:
+        return False, tr(
+            channel_id,
+            "❌ Invalid duration. Use `s`, `m`, `d`, for example `10d10m10s`.",
+            "❌ Thời gian không hợp lệ. Dùng `s`, `m`, `d`, ví dụ `10d10m10s`."
+        )
+
+    now_ts = __import__("time").time()
+    existing = get_temporary_ban(guild.id, user_id)
+    if existing and float(existing[0]) > now_ts:
+        expires_at = float(existing[0]) + seconds
+    else:
+        expires_at = now_ts + seconds
+
+    try:
+        if member is not None:
+            await guild.ban(member, reason=reason or "Banned by moderator", delete_message_seconds=0)
+        else:
+            await guild.ban(discord.Object(id=user_id), reason=reason or "Banned by moderator", delete_message_seconds=0)
+    except discord.Forbidden:
+        return False, tr(
+            channel_id,
+            "❌ I cannot ban this member. Check my Ban Members permission and role position.",
+            "❌ Bot không thể ban thành viên này. Hãy kiểm tra quyền Ban Members và vị trí role của bot."
+        )
+    except discord.HTTPException as e:
+        # Already banned: we can still extend the existing temporary-ban timer.
+        if getattr(e, "status", None) != 400:
+            print("[BAN ERROR]", repr(e))
+            return False, tr(channel_id, "❌ Could not ban this member.", "❌ Không thể ban thành viên này.")
+
+    save_temporary_ban(guild.id, user_id, expires_at, reason or "Banned by moderator")
+    schedule_temporary_unban(guild.id, user_id, expires_at)
+
+    total_remaining = max(1, int(expires_at - now_ts))
+    return True, tr(
+        channel_id,
+        f"🔨 <@{user_id}> banned for `{format_duration(total_remaining)}`.",
+        f"🔨 Đã ban <@{user_id}> trong `{format_duration(total_remaining)}`."
+    )
+
+
+@bot.tree.command(name="mute", description="Temporarily mute a member")
+@app_commands.describe(
+    member="Member to mute",
+    duration="Duration: 10s, 10m, 10d, or 10d10m10s",
+    reason="Optional reason"
+)
+@app_commands.checks.has_permissions(moderate_members=True)
+async def mute_slash(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    duration: str,
+    reason: str = ""
+):
+    ok, message = await _mute_member(
+        member, duration, reason,
+        interaction.channel.id if interaction.channel else 0
+    )
+    await interaction.response.send_message(message, ephemeral=not ok)
+
+
+@bot.tree.command(name="ban", description="Temporarily ban a member")
+@app_commands.describe(
+    member="Member to ban",
+    duration="Duration: 10s, 10m, 10d, or 10d10m10s",
+    reason="Optional reason"
+)
+@app_commands.checks.has_permissions(ban_members=True)
+async def ban_slash(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    duration: str,
+    reason: str = ""
+):
+    ok, message = await _ban_member(
+        interaction.guild, member.id, duration, reason,
+        interaction.channel.id if interaction.channel else 0,
+        member
+    )
+    await interaction.response.send_message(message, ephemeral=not ok)
+
+
+@bot.command(name="mute")
+@commands.has_guild_permissions(moderate_members=True)
+async def mute_prefix(ctx, member: discord.Member, duration: str, *, reason: str = ""):
+    ok, message = await _mute_member(member, duration, reason, ctx.channel.id)
+    await ctx.send(message)
+
+
+@bot.command(name="ban")
+@commands.has_guild_permissions(ban_members=True)
+async def ban_prefix(ctx, member: discord.Member, duration: str, *, reason: str = ""):
+    ok, message = await _ban_member(
+        ctx.guild, member.id, duration, reason, ctx.channel.id, member
+    )
+    await ctx.send(message)
+
+
 # =========================================================
 # IMAGE COMMANDS: AVATAR + CAPTION
 # =========================================================
@@ -2295,11 +2637,29 @@ async def ai_off_prefix(ctx):
 
 @bot.command(name="ai_channel")
 @commands.has_guild_permissions(manage_guild=True)
-async def ai_channel_prefix(ctx, channel: discord.TextChannel):
+async def ai_channel_prefix(ctx, channel: discord.TextChannel, enabled: bool):
     guild_id = ctx.guild.id
+
     ai_channels[guild_id] = channel.id
+    ai_enabled[guild_id] = enabled
+    if enabled:
+        reply_intervals.setdefault(guild_id, DEFAULT_INTERVAL)
+        message_counts[guild_id] = 0
+
     save_settings(guild_id)
-    await ctx.send(tr(ctx.channel.id, f"✅ AI is active in {channel.mention}", f"✅ AI hoạt động ở {channel.mention}"))
+
+    if enabled:
+        await ctx.send(tr(
+            ctx.channel.id,
+            f"✅ AI enabled in {channel.mention}.",
+            f"✅ AI đã bật ở {channel.mention}."
+        ))
+    else:
+        await ctx.send(tr(
+            ctx.channel.id,
+            f"🛑 AI disabled in {channel.mention}. The channel is still saved; use `!ai_channel {channel.mention} true` to enable it again.",
+            f"🛑 AI đã tắt ở {channel.mention}. Kênh vẫn được lưu; dùng `!ai_channel {channel.mention} true` để bật lại."
+        ))
 
 
 @bot.command(name="ai_interval")
@@ -2408,8 +2768,7 @@ async def gif_prefix(ctx, *, keyword: str = ""):
 
 @bot.command(name="help")
 async def help_prefix(ctx):
-    text = build_help_text(ctx.channel.id)
-    await send_long_text(ctx, text)
+    await ctx.send(embed=build_help_embed(ctx.channel.id))
 
 
 @bot.event
@@ -2539,12 +2898,15 @@ async def on_message(message: discord.Message):
             answer = await ask_ai_async(guild_id, prompt)
 
         if not answer:
+            if get_plan(guild_id) == PLAN_FREE:
+                error_en = "⚠️ Gemini did not return a response. Check GEMINI_API_KEY, the Gemini model, or the API quota."
+                error_vi = "⚠️ Gemini không trả về phản hồi. Hãy kiểm tra GEMINI_API_KEY, model Gemini hoặc giới hạn API."
+            else:
+                error_en = "⚠️ Premium AI did not return a response. Check OPENAI_API_KEY, the OpenAI model, or the API quota."
+                error_vi = "⚠️ Premium AI không trả về phản hồi. Hãy kiểm tra OPENAI_API_KEY, model OpenAI hoặc giới hạn API."
+
             await message.channel.send(
-                tr(
-                    message.channel.id,
-                    "⚠️ Gemini did not return a response. Check GEMINI_API_KEY, the Gemini model, or the API quota.",
-                    "⚠️ Gemini không trả về phản hồi. Hãy kiểm tra GEMINI_API_KEY, model Gemini hoặc giới hạn API.",
-                )
+                tr(message.channel.id, error_en, error_vi)
             )
         else:
             await send_ai_response(
@@ -2626,6 +2988,8 @@ for _command in (
     premium_remove_slash,
     caption_slash,
     avatar_slash,
+    mute_slash,
+    ban_slash,
 ):
     _command.error(generic_app_command_error)
 
@@ -2636,6 +3000,8 @@ ai_channel.error(permission_error)
 ai_interval.error(permission_error)
 genz_add.error(permission_error)
 gif_add.error(permission_error)
+mute_slash.error(permission_error)
+ban_slash.error(permission_error)
 
 
 # =========================================================
