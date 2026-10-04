@@ -116,12 +116,20 @@ def init_db():
         CREATE TABLE IF NOT EXISTS learned_facts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             guild_id INTEGER,
+            channel_id INTEGER,
             user_id INTEGER,
             username TEXT,
             fact TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
+    # Older databases did not store the channel for facts.
+    # Keep existing rows, but add channel_id so new facts are isolated per #channel.
+    cur.execute("PRAGMA table_info(learned_facts)")
+    fact_columns = {row[1] for row in cur.fetchall()}
+    if "channel_id" not in fact_columns:
+        cur.execute("ALTER TABLE learned_facts ADD COLUMN channel_id INTEGER")
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS genz_terms (
@@ -475,17 +483,18 @@ def save_summary(guild_id, summary):
 # LEARNED FACTS
 # =========================================================
 
-def get_facts(guild_id, limit=100):
+def get_facts(guild_id, channel_id, limit=100):
+    """Return only facts learned in this specific Discord #channel."""
     conn = get_db()
     cur = conn.cursor()
 
     cur.execute("""
         SELECT username, fact
         FROM learned_facts
-        WHERE guild_id = ?
+        WHERE guild_id = ? AND channel_id = ?
         ORDER BY id DESC
         LIMIT ?
-    """, (guild_id, limit))
+    """, (guild_id, channel_id, limit))
 
     rows = cur.fetchall()
     conn.close()
@@ -494,7 +503,7 @@ def get_facts(guild_id, limit=100):
     return rows
 
 
-def save_fact(guild_id, user_id, username, fact):
+def save_fact(guild_id, channel_id, user_id, username, fact):
     fact = fact.strip()
 
     if len(fact) < 3:
@@ -503,11 +512,13 @@ def save_fact(guild_id, user_id, username, fact):
     conn = get_db()
     cur = conn.cursor()
 
+    # The same fact may legitimately exist in different channels.
+    # Deduplicate only inside the current guild + channel.
     cur.execute("""
         SELECT id FROM learned_facts
-        WHERE guild_id = ? AND fact = ?
+        WHERE guild_id = ? AND channel_id = ? AND fact = ?
         LIMIT 1
-    """, (guild_id, fact))
+    """, (guild_id, channel_id, fact))
 
     if cur.fetchone():
         conn.close()
@@ -515,20 +526,27 @@ def save_fact(guild_id, user_id, username, fact):
 
     cur.execute("""
         INSERT INTO learned_facts
-        (guild_id, user_id, username, fact)
-        VALUES (?, ?, ?, ?)
-    """, (guild_id, user_id, username, fact))
+        (guild_id, channel_id, user_id, username, fact)
+        VALUES (?, ?, ?, ?, ?)
+    """, (guild_id, channel_id, user_id, username, fact))
 
+    # Keep the fact limit independently for each #channel.
     cur.execute("""
         DELETE FROM learned_facts
-        WHERE guild_id = ?
+        WHERE guild_id = ? AND channel_id = ?
         AND id NOT IN (
             SELECT id FROM learned_facts
-            WHERE guild_id = ?
+            WHERE guild_id = ? AND channel_id = ?
             ORDER BY id DESC
             LIMIT ?
         )
-    """, (guild_id, guild_id, get_tier_limits(guild_id)["max_facts"]))
+    """, (
+        guild_id,
+        channel_id,
+        guild_id,
+        channel_id,
+        get_tier_limits(guild_id)["max_facts"],
+    ))
 
     conn.commit()
     conn.close()
@@ -1180,6 +1198,7 @@ Chỉ trả về đúng một dòng.
         if len(fact) <= 300:
             save_fact(
                 message.guild.id,
+                message.channel.id,
                 message.author.id,
                 message.author.display_name,
                 fact
@@ -1216,7 +1235,7 @@ def build_ai_prompt(message):
 
     summary = get_summary(guild_id)
     limits = get_tier_limits(guild_id)
-    facts = get_facts(guild_id, limits["facts"])
+    facts = get_facts(guild_id, message.channel.id, limits["facts"])
     recent = get_recent_messages(guild_id, limits["recent"])
     genz = get_genz_terms(guild_id, limits["genz"])
     emotes = get_server_emotes(guild)
@@ -1601,7 +1620,7 @@ async def ai_memory(interaction: discord.Interaction):
     channel_id = interaction.channel.id if interaction.channel else 0
 
     summary = get_summary(guild_id)
-    facts = get_facts(guild_id, 15)
+    facts = get_facts(guild_id, interaction.channel.id if interaction.channel else 0, 15)
     genz = get_genz_terms(guild_id, 15)
 
     if get_language(channel_id) == LANG_VI:
@@ -2826,7 +2845,7 @@ async def ai_memory_prefix(ctx):
     guild_id = ctx.guild.id
     channel_id = ctx.channel.id
     summary = get_summary(guild_id)
-    facts = get_facts(guild_id, 15)
+    facts = get_facts(guild_id, ctx.channel.id, 15)
     genz = get_genz_terms(guild_id, 15)
 
     if get_language(channel_id) == LANG_VI:
