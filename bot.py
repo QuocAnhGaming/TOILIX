@@ -31,21 +31,9 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 SUPPORT_CHANNEL_ID = int(os.getenv("SUPPORT_CHANNEL_ID", "0") or 0)
 
-# FREE AI FALLBACK CHAIN
+# FREE: giữ AI cũ của bot (Gemini).
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
-
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b").strip()
-
-MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "").strip()
-MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "mistral-small-latest").strip()
-
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free").strip()
-
-COHERE_API_KEY = os.getenv("COHERE_API_KEY", "").strip()
-COHERE_MODEL = os.getenv("COHERE_MODEL", "command-r7b-12-2024").strip()
 
 # STANDARD/PREMIUM: AI mới qua OpenAI. Đổi model bằng .env.
 STANDARD_MODEL = os.getenv("STANDARD_MODEL", "gpt-6-sol")
@@ -59,7 +47,7 @@ EARLY_REPLY_CHANCE = 0.10
 DB_FILE = os.getenv("DB_FILE", "memory.db")
 
 MEMORY_TRIGGER = 270
-MEMORY_KEEP = 68
+MEMORY_KEEP = 100
 MAX_LEARNED_FACTS = 100
 MAX_GENZ_TERMS = 300
 
@@ -149,12 +137,19 @@ def init_db():
         CREATE TABLE IF NOT EXISTS learned_facts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             guild_id INTEGER,
+            channel_id INTEGER DEFAULT 0,
             user_id INTEGER,
             username TEXT,
             fact TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
+    # Migrate older server-wide facts to channel-aware facts.
+    cur.execute("PRAGMA table_info(learned_facts)")
+    fact_columns = [row[1] for row in cur.fetchall()]
+    if fact_columns and "channel_id" not in fact_columns:
+        cur.execute("ALTER TABLE learned_facts ADD COLUMN channel_id INTEGER DEFAULT 0")
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS genz_terms (
@@ -264,9 +259,9 @@ PLAN_STANDARD = "standard"
 PLAN_PREMIUM = "premium"
 PLAN_ORDER = {PLAN_FREE: 0, PLAN_STANDARD: 1, PLAN_PREMIUM: 2}
 TIER_LIMITS = {
-    PLAN_FREE: {"min_interval": 5, "max_interval": 15, "memory_trigger": 270, "memory_keep": 68, "max_facts": 100, "max_genz": 300, "recent": 35, "facts": 100, "genz": 120, "gifs": 25},
-    PLAN_STANDARD: {"min_interval": 3, "max_interval": 12, "memory_trigger": 400, "memory_keep": 100, "max_facts": 200, "max_genz": 500, "recent": 60, "facts": 160, "genz": 220, "gifs": 40},
-    PLAN_PREMIUM: {"min_interval": 2, "max_interval": 10, "memory_trigger": 600, "memory_keep": 150, "max_facts": 500, "max_genz": 800, "recent": 100, "facts": 300, "genz": 350, "gifs": 60},
+    PLAN_FREE: {"min_interval": 5, "max_interval": 15, "memory_trigger": 270, "memory_keep": 100, "max_facts": 100, "max_genz": 300, "recent": 35, "facts": 100, "genz": 120, "gifs": 25},
+    PLAN_STANDARD: {"min_interval": 3, "max_interval": 12, "memory_trigger": 400, "memory_keep": 180, "max_facts": 200, "max_genz": 500, "recent": 60, "facts": 160, "genz": 220, "gifs": 40},
+    PLAN_PREMIUM: {"min_interval": 2, "max_interval": 10, "memory_trigger": 600, "memory_keep": 300, "max_facts": 500, "max_genz": 800, "recent": 100, "facts": 300, "genz": 350, "gifs": 60},
 }
 
 def get_plan(guild_id):
@@ -514,17 +509,17 @@ def save_summary(guild_id, channel_id, summary):
 # LEARNED FACTS
 # =========================================================
 
-def get_facts(guild_id, limit=100):
+def get_facts(guild_id, channel_id, limit=100):
     conn = get_db()
     cur = conn.cursor()
 
     cur.execute("""
-        SELECT username, fact
+        SELECT id, username, fact
         FROM learned_facts
-        WHERE guild_id = ?
+        WHERE guild_id = ? AND channel_id = ?
         ORDER BY id DESC
         LIMIT ?
-    """, (guild_id, limit))
+    """, (guild_id, channel_id, limit))
 
     rows = cur.fetchall()
     conn.close()
@@ -533,7 +528,7 @@ def get_facts(guild_id, limit=100):
     return rows
 
 
-def save_fact(guild_id, user_id, username, fact):
+def save_fact(guild_id, channel_id, user_id, username, fact):
     fact = fact.strip()
 
     if len(fact) < 3:
@@ -544,9 +539,9 @@ def save_fact(guild_id, user_id, username, fact):
 
     cur.execute("""
         SELECT id FROM learned_facts
-        WHERE guild_id = ? AND fact = ?
+        WHERE guild_id = ? AND channel_id = ? AND fact = ?
         LIMIT 1
-    """, (guild_id, fact))
+    """, (guild_id, channel_id, fact))
 
     if cur.fetchone():
         conn.close()
@@ -554,23 +549,72 @@ def save_fact(guild_id, user_id, username, fact):
 
     cur.execute("""
         INSERT INTO learned_facts
-        (guild_id, user_id, username, fact)
-        VALUES (?, ?, ?, ?)
-    """, (guild_id, user_id, username, fact))
+        (guild_id, channel_id, user_id, username, fact)
+        VALUES (?, ?, ?, ?, ?)
+    """, (guild_id, channel_id, user_id, username, fact))
 
     cur.execute("""
         DELETE FROM learned_facts
-        WHERE guild_id = ?
+        WHERE guild_id = ? AND channel_id = ?
         AND id NOT IN (
             SELECT id FROM learned_facts
-            WHERE guild_id = ?
+            WHERE guild_id = ? AND channel_id = ?
             ORDER BY id DESC
             LIMIT ?
         )
-    """, (guild_id, guild_id, get_tier_limits(guild_id)["max_facts"]))
+    """, (
+        guild_id, channel_id, guild_id, channel_id,
+        get_tier_limits(guild_id)["max_facts"]
+    ))
 
     conn.commit()
     conn.close()
+
+
+def update_fact(guild_id, channel_id, old_fact, new_fact, user_id=None, username=None):
+    old_fact = old_fact.strip()
+    new_fact = new_fact.strip()
+    if len(old_fact) < 3 or len(new_fact) < 3:
+        return False
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id FROM learned_facts
+        WHERE guild_id = ? AND channel_id = ? AND fact = ?
+        ORDER BY id DESC LIMIT 1
+    """, (guild_id, channel_id, old_fact))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return False
+
+    fact_id = row[0]
+    cur.execute("""
+        UPDATE learned_facts
+        SET fact = ?, user_id = COALESCE(?, user_id), username = COALESCE(?, username), created_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND guild_id = ? AND channel_id = ?
+    """, (new_fact, user_id, username, fact_id, guild_id, channel_id))
+    conn.commit()
+    conn.close()
+    return True
+
+
+def delete_fact(guild_id, channel_id, fact):
+    fact = fact.strip()
+    if not fact:
+        return False
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        DELETE FROM learned_facts
+        WHERE guild_id = ? AND channel_id = ? AND fact = ?
+    """, (guild_id, channel_id, fact))
+    deleted = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
 
 
 # =========================================================
@@ -926,80 +970,26 @@ def get_gif_keywords(guild_id):
 # AI BACKENDS
 # =========================================================
 
-def _extract_openai_style_answer(data):
-    choices = data.get("choices") or []
-    if not choices:
-        return None
-    message = choices[0].get("message") or {}
-    content = message.get("content", "")
-    if isinstance(content, list):
-        content = "".join(
-            item.get("text", "") for item in content
-            if isinstance(item, dict)
-        )
-    return str(content).strip() or None
-
-
-def _post_chat_completion(url, api_key, model, prompt, provider, headers=None):
-    if not api_key:
-        return None, False
-
-    request_headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    if headers:
-        request_headers.update(headers)
-
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.75,
-        "max_tokens": 500,
-    }
-
-    try:
-        response = requests.post(
-            url,
-            headers=request_headers,
-            json=payload,
-            timeout=60,
-        )
-        if response.status_code != 200:
-            if response.status_code in (401, 403, 429):
-                print(f"[{provider}] unavailable HTTP {response.status_code}; trying next AI.")
-            else:
-                print(f"[{provider}] HTTP {response.status_code}; trying next AI.")
-            return None, True
-
-        answer = _extract_openai_style_answer(response.json())
-        if not answer:
-            print(f"[{provider}] empty response; trying next AI.")
-            return None, True
-        return answer, False
-    except requests.RequestException:
-        print(f"[{provider}] network error; trying next AI.")
-        return None, True
-    except Exception as e:
-        print(f"[{provider}] error: {e!r}; trying next AI.")
-        return None, True
-
-
 def ask_gemini(prompt):
-    """Gemini Free backend. Returns (answer, failed) for fallback handling."""
+    """Free AI backend. Uses Gemini API through HTTPS; no Gemini/OpenAI required."""
     if not GEMINI_API_KEY:
-        return None, False
+        print("[GEMINI ERROR] GEMINI_API_KEY is missing.")
+        return None
 
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
         f"{GEMINI_MODEL}:generateContent"
     )
     payload = {
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": prompt}],
+            }
+        ],
         "generationConfig": {
             "temperature": 0.75,
             "topP": 0.9,
-            "maxOutputTokens": 500,
         },
     }
 
@@ -1008,20 +998,22 @@ def ask_gemini(prompt):
             url,
             params={"key": GEMINI_API_KEY},
             json=payload,
-            timeout=60,
+            timeout=120,
         )
+
         if response.status_code != 200:
-            if response.status_code in (401, 403, 429):
-                print(f"[GEMINI] HTTP {response.status_code}; trying next AI.")
-            else:
-                print(f"[GEMINI] HTTP {response.status_code}; trying next AI.")
-            return None, True
+            try:
+                detail = response.json().get("error", {}).get("message", response.text)
+            except Exception:
+                detail = response.text
+            print(f"[GEMINI ERROR] HTTP {response.status_code}: {detail}")
+            return None
 
         data = response.json()
         candidates = data.get("candidates") or []
         if not candidates:
-            print("[GEMINI] No usable candidate; trying next AI.")
-            return None, True
+            print("[GEMINI ERROR] No candidates returned:", data)
+            return None
 
         parts = candidates[0].get("content", {}).get("parts", [])
         answer = "".join(
@@ -1029,79 +1021,19 @@ def ask_gemini(prompt):
             for part in parts
             if isinstance(part, dict)
         ).strip()
+
         if not answer:
-            print("[GEMINI] Empty response; trying next AI.")
-            return None, True
-        return answer, False
-    except requests.RequestException:
-        print("[GEMINI] Network error; trying next AI.")
-        return None, True
+            print("[GEMINI ERROR] Empty text returned:", data)
+            return None
+
+        return answer
+
+    except requests.RequestException as e:
+        print("[GEMINI ERROR] Network:", repr(e))
+        return None
     except Exception as e:
-        print(f"[GEMINI] Error: {e!r}; trying next AI.")
-        return None, True
-
-
-def ask_groq(prompt):
-    return _post_chat_completion(
-        "https://api.groq.com/openai/v1/chat/completions",
-        GROQ_API_KEY, GROQ_MODEL, prompt, "GROQ"
-    )
-
-
-def ask_mistral(prompt):
-    return _post_chat_completion(
-        "https://api.mistral.ai/v1/chat/completions",
-        MISTRAL_API_KEY, MISTRAL_MODEL, prompt, "MISTRAL"
-    )
-
-
-def ask_openrouter(prompt):
-    return _post_chat_completion(
-        "https://openrouter.ai/api/v1/chat/completions",
-        OPENROUTER_API_KEY, OPENROUTER_MODEL, prompt, "OPENROUTER",
-        {"HTTP-Referer": "https://discord.com", "X-Title": "TOILIX Discord Bot"}
-    )
-
-
-def ask_cohere(prompt):
-    if not COHERE_API_KEY:
-        return None, False
-
-    try:
-        response = requests.post(
-            "https://api.cohere.com/v2/chat",
-            headers={
-                "Authorization": f"Bearer {COHERE_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": COHERE_MODEL,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.75,
-                "max_tokens": 500,
-            },
-            timeout=60,
-        )
-        if response.status_code != 200:
-            print(f"[COHERE] HTTP {response.status_code}; trying next AI.")
-            return None, True
-        data = response.json()
-        message = data.get("message") or {}
-        content = message.get("content") or []
-        answer = "".join(
-            item.get("text", "") for item in content
-            if isinstance(item, dict)
-        ).strip()
-        if not answer:
-            print("[COHERE] Empty response; trying next AI.")
-            return None, True
-        return answer, False
-    except requests.RequestException:
-        print("[COHERE] Network error; trying next AI.")
-        return None, True
-    except Exception as e:
-        print(f"[COHERE] Error: {e!r}; trying next AI.")
-        return None, True
+        print("[GEMINI ERROR]", repr(e))
+        return None
 
 
 def ask_openai(prompt, model):
@@ -1121,30 +1053,9 @@ def ask_openai(prompt, model):
 
 async def ask_ai_async(guild_id, prompt):
     plan = get_plan(guild_id)
-    if plan != PLAN_FREE:
-        return await asyncio.to_thread(ask_openai, prompt, plan_model(guild_id))
-
-    # Free chain: shared prompt/memory, only the AI provider changes.
-    backends = (
-        ("Gemini", ask_gemini),
-        ("Groq", ask_groq),
-        ("Mistral", ask_mistral),
-        ("OpenRouter", ask_openrouter),
-        ("Cohere", ask_cohere),
-    )
-
-    for index, (name, backend) in enumerate(backends):
-        answer, failed = await asyncio.to_thread(backend, prompt)
-        if answer:
-            if index > 0:
-                print(f"[AI FALLBACK] Using {name} after earlier Free AI failed.")
-            return answer
-        if not failed:
-            # Missing key: silently skip this provider.
-            continue
-
-    print("[AI FALLBACK] All configured Free AI providers failed or are out of quota.")
-    return None
+    if plan == PLAN_FREE:
+        return await asyncio.to_thread(ask_gemini, prompt)
+    return await asyncio.to_thread(ask_openai, prompt, plan_model(guild_id))
 
 # =========================================================
 # MESSAGE HELPERS
@@ -1272,14 +1183,8 @@ Chỉ trả về summary mới, ngắn gọn.
 
     new_summary = await ask_ai_async(guild_id, prompt)
 
-    # Chỉ xóa tin cũ sau khi Summary tạo thành công.
-    # Nếu cả 5 AI đều hết quota/lỗi, giữ nguyên memory để không mất dữ liệu.
-    if not new_summary:
-        conn.close()
-        print(f"[MEMORY] Summary failed; kept {len(rows)} old messages in {guild_id}/{channel_id}")
-        return
-
-    save_summary(guild_id, channel_id, new_summary)
+    if new_summary:
+        save_summary(guild_id, channel_id, new_summary)
 
     ids = [row[0] for row in rows]
     placeholders = ",".join("?" for _ in ids)
@@ -1304,49 +1209,45 @@ async def learn_from_message(message):
         return
 
     content = clean_message_content(message)
-
     if not content:
         return
+
+    guild_id = message.guild.id
+    channel_id = message.channel.id
+    existing = get_facts(guild_id, channel_id, 30)
+    existing_text = "\n".join(
+        f"[{fact_id}] {username}: {fact}" for fact_id, username, fact in existing
+    ) or "(chưa có fact nào)"
 
     prompt = f"""
 Bạn là hệ thống tự học của Discord AI.
 
-Tin nhắn:
+Các fact hiện có trong channel này:
+{existing_text}
+
+Tin nhắn mới:
 {content}
 
-Hãy kiểm tra xem có điều gì đáng nhớ lâu dài không.
+Hãy xác định xem tin nhắn có làm thay đổi hoặc hủy một fact đã lưu hay tạo fact mới không.
 
-CÓ THỂ HỌC:
-- sở thích
-- cách người dùng muốn bot nói chuyện
-- thông tin ổn định về server
-- dự án dài hạn
-- slang/meme phrase và nghĩa theo ngữ cảnh
+QUY TẮC FACT:
+- Chỉ lưu thông tin có khả năng hữu ích lâu dài.
+- Nếu thông tin mới mâu thuẫn với một fact cũ và rõ ràng là thông tin thật mới, hãy UPDATE fact cũ.
+- Nếu người dùng đính chính rằng một fact cũ là sai, nói đùa, meme, roleplay, không thật, hoặc không có chuyện đó, hãy DELETE fact cũ.
+- Các câu kiểu "tôi yêu X" không được xem là fact chắc chắn nếu ngữ cảnh cho thấy đó chỉ là joke.
+- Không xóa fact chỉ vì nó lâu không được nhắc tới.
+- Không học mật khẩu, token, API key, thông tin đăng nhập, tài chính hoặc dữ liệu nhạy cảm.
 
-KHÔNG HỌC:
-- mật khẩu
-- token
-- API key
-- thông tin đăng nhập
-- tài chính
-- dữ liệu nhạy cảm
-- câu chửi tục như một phong cách mặc định
-- câu nói nhất thời
-
-Nếu là slang/meme mới:
-GENZ: term | meaning | example
-
-Nếu là fact:
-FACT: một câu ngắn
-
-Nếu không có gì:
+Đầu ra CHỈ được là một dòng theo một trong các dạng sau:
+FACT: một fact mới
+UPDATE: ID_FACT_CŨ | fact mới
+DELETE: ID_FACT_CŨ
 NO_LEARN
 
-Chỉ trả về đúng một dòng.
+Nếu tin nhắn không đủ chắc chắn để thay đổi memory, trả về NO_LEARN.
 """
 
-    result = await ask_ai_async(message.guild.id, prompt)
-
+    result = await ask_ai_async(guild_id, prompt)
     if not result:
         return
 
@@ -1354,16 +1255,59 @@ Chỉ trả về đúng một dòng.
 
     if result.startswith("FACT:"):
         fact = result[5:].strip()
-
         if len(fact) <= 300:
             save_fact(
-                message.guild.id,
-                message.author.id,
-                message.author.display_name,
-                fact
+                guild_id, channel_id, message.author.id,
+                message.author.display_name, fact
             )
-
             print("[LEARN FACT]", fact)
+
+    elif result.startswith("UPDATE:"):
+        raw = result[7:].strip()
+        parts = [p.strip() for p in raw.split("|", 1)]
+        if len(parts) == 2:
+            try:
+                fact_id = int(parts[0])
+            except ValueError:
+                return
+            new_fact = parts[1]
+            if len(new_fact) > 300:
+                return
+
+            conn = get_db()
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE learned_facts
+                SET fact = ?, user_id = ?, username = ?, created_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND guild_id = ? AND channel_id = ?
+            """, (
+                new_fact, message.author.id, message.author.display_name,
+                fact_id, guild_id, channel_id
+            ))
+            changed = cur.rowcount > 0
+            conn.commit()
+            conn.close()
+            if changed:
+                print("[UPDATE FACT]", fact_id, "->", new_fact)
+
+    elif result.startswith("DELETE:"):
+        raw = result[7:].strip()
+        try:
+            fact_id = int(raw)
+        except ValueError:
+            return
+
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM learned_facts WHERE id = ? AND guild_id = ? AND channel_id = ?",
+            (fact_id, guild_id, channel_id)
+        )
+        deleted = cur.rowcount > 0
+        conn.commit()
+        conn.close()
+        if deleted:
+            print("[DELETE FACT]", fact_id)
 
     elif result.startswith("GENZ:"):
         raw = result[5:].strip()
@@ -1373,14 +1317,7 @@ Chỉ trả về đúng một dòng.
             term = parts[0]
             meaning = parts[1]
             example = parts[2] if len(parts) >= 3 else ""
-
-            save_genz_term(
-                message.guild.id,
-                term,
-                meaning,
-                example
-            )
-
+            save_genz_term(guild_id, term, meaning, example)
             print("[LEARN GENZ]", term, "=", meaning)
 
 
@@ -1394,7 +1331,7 @@ def build_ai_prompt(message):
 
     summary = get_summary(guild_id, message.channel.id)
     limits = get_tier_limits(guild_id)
-    facts = get_facts(guild_id, limits["facts"])
+    facts = get_facts(guild_id, message.channel.id, limits["facts"])
     recent = get_recent_messages(guild_id, limits["recent"])
     genz = get_genz_terms(guild_id, limits["genz"])
     emotes = get_server_emotes(guild)
@@ -1779,7 +1716,7 @@ async def ai_memory(interaction: discord.Interaction):
     channel_id = interaction.channel.id if interaction.channel else 0
 
     summary = get_summary(guild_id, channel_id)
-    facts = get_facts(guild_id, 15)
+    facts = get_facts(guild_id, channel_id, 15)
     genz = get_genz_terms(guild_id, 15)
 
     if get_language(channel_id) == LANG_VI:
@@ -2900,7 +2837,7 @@ async def ai_memory_prefix(ctx):
     guild_id = ctx.guild.id
     channel_id = ctx.channel.id
     summary = get_summary(guild_id, channel_id)
-    facts = get_facts(guild_id, 15)
+    facts = get_facts(guild_id, channel_id, 15)
     genz = get_genz_terms(guild_id, 15)
 
     if get_language(channel_id) == LANG_VI:
