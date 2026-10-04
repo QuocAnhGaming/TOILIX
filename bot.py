@@ -1715,7 +1715,7 @@ def build_help_embed(channel_id):
             "help", "language", "ai_on", "ai_off", "ai_channel",
             "ai_interval", "status", "ai_memory",
         ],
-        ("🛡️ Moderation", "🛡️ Quản trị"): ["mute", "ban"],
+        ("🛡️ Moderation", "🛡️ Quản trị"): ["mute", "unmute", "ban", "unban"],
         ("🎨 Media", "🎨 Media"): ["caption", "avatar", "gif", "gif_add"],
         ("🧠 Learning", "🧠 Học tập"): ["genz_add"],
         ("💎 Premium", "💎 Premium"): [
@@ -1726,9 +1726,8 @@ def build_help_embed(channel_id):
 
     # Keep the embed close to the clean Owo command-list style:
     # one category per field, commands rendered as compact Discord code chips.
-    # One clean Discord embed = the outer "box".
-    # Blurple matches the Discord/Owo-style colored left border.
     embed = discord.Embed(
+        title="Command List",
         description=(
             "Here is the list of commands!\n"
             "Commands can be used with either `/` or `!`.\n"
@@ -1738,17 +1737,8 @@ def build_help_embed(channel_id):
             "Các lệnh có thể dùng bằng cả `/` và `!`.\n"
             "Cần hỗ trợ thêm? Dùng `/support`."
         ),
-        color=discord.Color.from_rgb(88, 101, 242),
+        color=discord.Color.blurple(),
     )
-
-    # Owo-style header: bot avatar + Command List inside the same box.
-    if bot.user:
-        embed.set_author(
-            name="Command List",
-            icon_url=bot.user.display_avatar.url,
-        )
-    else:
-        embed.set_author(name="Command List")
 
     for (en_name, vi_name), names in groups.items():
         visible = [name for name in names if name in command_names]
@@ -1769,9 +1759,9 @@ def build_help_embed(channel_id):
     embed.add_field(
         name="⏱️ Duration" if not is_vi else "⏱️ Thời gian",
         value=(
-            "`10s` `10m` `10d` • Mute/Ban also support `10d10m10s`."
+            "`10s` `10m` `10h` `10d` • Mute/Ban also support `10d10h10m10s`."
             if not is_vi else
-            "`10s` `10m` `10d` • Mute/Ban cũng hỗ trợ `10d10m10s`."
+            "`10s` `10m` `10h` `10d` • Mute/Ban cũng hỗ trợ `10d10h10m10s`."
         ),
         inline=False,
     )
@@ -2087,12 +2077,12 @@ async def premium_remove_slash(
 # MODERATION: MUTE + TEMPORARY BAN
 # =========================================================
 
-DURATION_RE = re.compile(r"(?P<value>\d+)\s*(?P<unit>[smd])", re.IGNORECASE)
+DURATION_RE = re.compile(r"(?P<value>\d+)\s*(?P<unit>[smhd])", re.IGNORECASE)
 MAX_TIMEOUT_SECONDS = 28 * 24 * 60 * 60
 
 
 def parse_duration(value: str):
-    """Parse durations such as 10s, 10m, 10d, or 10d10m10s."""
+    """Parse durations such as 10s, 10m, 10h, 10d, or 10d10h10m10s."""
     if not value:
         return None
 
@@ -2110,6 +2100,8 @@ def parse_duration(value: str):
             total += amount
         elif unit == "m":
             total += amount * 60
+        elif unit == "h":
+            total += amount * 3600
         elif unit == "d":
             total += amount * 86400
 
@@ -2119,10 +2111,13 @@ def parse_duration(value: str):
 def format_duration(seconds: int):
     seconds = int(seconds)
     days, seconds = divmod(seconds, 86400)
+    hours, seconds = divmod(seconds, 3600)
     minutes, seconds = divmod(seconds, 60)
     parts = []
     if days:
         parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
     if minutes:
         parts.append(f"{minutes}m")
     if seconds or not parts:
@@ -2234,8 +2229,8 @@ async def _mute_member(member: discord.Member, duration_text: str, reason: str, 
     if seconds is None:
         return False, tr(
             channel_id,
-            "❌ Invalid duration. Use `s`, `m`, `d`, for example `10d10m10s`.",
-            "❌ Thời gian không hợp lệ. Dùng `s`, `m`, `d`, ví dụ `10d10m10s`."
+            "❌ Invalid duration. Use `s`, `m`, `h`, `d`, for example `10d10h10m10s`.",
+            "❌ Thời gian không hợp lệ. Dùng `s`, `m`, `h`, `d`, ví dụ `10d10h10m10s`."
         )
 
     now = datetime.now(timezone.utc)
@@ -2275,8 +2270,8 @@ async def _ban_member(guild: discord.Guild, user_id: int, duration_text: str, re
     if seconds is None:
         return False, tr(
             channel_id,
-            "❌ Invalid duration. Use `s`, `m`, `d`, for example `10d10m10s`.",
-            "❌ Thời gian không hợp lệ. Dùng `s`, `m`, `d`, ví dụ `10d10m10s`."
+            "❌ Invalid duration. Use `s`, `m`, `h`, `d`, for example `10d10h10m10s`.",
+            "❌ Thời gian không hợp lệ. Dùng `s`, `m`, `h`, `d`, ví dụ `10d10h10m10s`."
         )
 
     now_ts = __import__("time").time()
@@ -2317,7 +2312,7 @@ async def _ban_member(guild: discord.Guild, user_id: int, duration_text: str, re
 @bot.tree.command(name="mute", description="Temporarily mute a member")
 @app_commands.describe(
     member="Member to mute",
-    duration="Duration: 10s, 10m, 10d, or 10d10m10s",
+    duration="Duration: 10s, 10m, 10h, 10d, or 10d10h10m10s",
     reason="Optional reason"
 )
 @app_commands.checks.has_permissions(moderate_members=True)
@@ -2334,10 +2329,36 @@ async def mute_slash(
     await interaction.response.send_message(message, ephemeral=not ok)
 
 
+@bot.tree.command(name="unmute", description="Remove a member's mute")
+@app_commands.describe(member="Member to unmute")
+@app_commands.checks.has_permissions(moderate_members=True)
+async def unmute_slash(interaction: discord.Interaction, member: discord.Member):
+    channel_id = interaction.channel.id if interaction.channel else 0
+    try:
+        await member.timeout(None, reason="Unmuted by moderator")
+    except discord.Forbidden:
+        message = tr(
+            channel_id,
+            "❌ I cannot unmute this member. Check my Moderate Members permission and role position.",
+            "❌ Bot không thể unmute thành viên này. Hãy kiểm tra quyền Moderate Members và vị trí role của bot."
+        )
+        await interaction.response.send_message(message, ephemeral=True)
+        return
+    except discord.HTTPException as e:
+        print("[UNMUTE ERROR]", repr(e))
+        message = tr(channel_id, "❌ Could not unmute this member.", "❌ Không thể unmute thành viên này.")
+        await interaction.response.send_message(message, ephemeral=True)
+        return
+
+    await interaction.response.send_message(
+        tr(channel_id, f"🔊 {member.mention} has been unmuted.", f"🔊 Đã unmute {member.mention}.")
+    )
+
+
 @bot.tree.command(name="ban", description="Temporarily ban a member")
 @app_commands.describe(
     member="Member to ban",
-    duration="Duration: 10s, 10m, 10d, or 10d10m10s",
+    duration="Duration: 10s, 10m, 10h, 10d, or 10d10h10m10s",
     reason="Optional reason"
 )
 @app_commands.checks.has_permissions(ban_members=True)
@@ -2355,11 +2376,96 @@ async def ban_slash(
     await interaction.response.send_message(message, ephemeral=not ok)
 
 
+@bot.tree.command(name="unban", description="Remove a member's ban")
+@app_commands.describe(user="User to unban")
+@app_commands.checks.has_permissions(ban_members=True)
+async def unban_slash(interaction: discord.Interaction, user: discord.User):
+    channel_id = interaction.channel.id if interaction.channel else 0
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message(
+            tr(channel_id, "❌ This command can only be used in a server.", "❌ Lệnh này chỉ dùng được trong server."),
+            ephemeral=True,
+        )
+        return
+
+    try:
+        await guild.unban(user, reason="Unbanned by moderator")
+    except discord.NotFound:
+        remove_temporary_ban(guild.id, user.id)
+        message = tr(
+            channel_id,
+            f"❌ {user.mention} is not currently banned.",
+            f"❌ {user.mention} hiện không bị ban."
+        )
+        await interaction.response.send_message(message, ephemeral=True)
+        return
+    except discord.Forbidden:
+        message = tr(
+            channel_id,
+            "❌ I cannot unban this user. Check my Ban Members permission.",
+            "❌ Bot không thể unban người dùng này. Hãy kiểm tra quyền Ban Members."
+        )
+        await interaction.response.send_message(message, ephemeral=True)
+        return
+    except discord.HTTPException as e:
+        print("[UNBAN ERROR]", repr(e))
+        message = tr(channel_id, "❌ Could not unban this user.", "❌ Không thể unban người dùng này.")
+        await interaction.response.send_message(message, ephemeral=True)
+        return
+
+    remove_temporary_ban(guild.id, user.id)
+    task = temporary_ban_tasks.pop((guild.id, user.id), None)
+    if task and not task.done():
+        task.cancel()
+
+    await interaction.response.send_message(
+        tr(channel_id, f"🔓 {user.mention} has been unbanned.", f"🔓 Đã unban {user.mention}.")
+    )
+
+
 @bot.command(name="mute")
 @commands.has_guild_permissions(moderate_members=True)
 async def mute_prefix(ctx, member: discord.Member, duration: str, *, reason: str = ""):
     ok, message = await _mute_member(member, duration, reason, ctx.channel.id)
     await ctx.send(message)
+
+
+@bot.command(name="unmute")
+@commands.has_guild_permissions(moderate_members=True)
+async def unmute_prefix(ctx, member: discord.Member):
+    try:
+        await member.timeout(None, reason="Unmuted by moderator")
+        await ctx.send(tr(ctx.channel.id, f"🔊 {member.mention} has been unmuted.", f"🔊 Đã unmute {member.mention}."))
+    except discord.Forbidden:
+        await ctx.send(tr(ctx.channel.id, "❌ I cannot unmute this member.", "❌ Bot không thể unmute thành viên này."))
+    except discord.HTTPException as e:
+        print("[UNMUTE ERROR]", repr(e))
+        await ctx.send(tr(ctx.channel.id, "❌ Could not unmute this member.", "❌ Không thể unmute thành viên này."))
+
+
+@bot.command(name="unban")
+@commands.has_guild_permissions(ban_members=True)
+async def unban_prefix(ctx, user: discord.User):
+    try:
+        await ctx.guild.unban(user, reason="Unbanned by moderator")
+    except discord.NotFound:
+        remove_temporary_ban(ctx.guild.id, user.id)
+        await ctx.send(tr(ctx.channel.id, f"❌ {user.mention} is not currently banned.", f"❌ {user.mention} hiện không bị ban."))
+        return
+    except discord.Forbidden:
+        await ctx.send(tr(ctx.channel.id, "❌ I cannot unban this user.", "❌ Bot không thể unban người dùng này."))
+        return
+    except discord.HTTPException as e:
+        print("[UNBAN ERROR]", repr(e))
+        await ctx.send(tr(ctx.channel.id, "❌ Could not unban this user.", "❌ Không thể unban người dùng này."))
+        return
+
+    remove_temporary_ban(ctx.guild.id, user.id)
+    task = temporary_ban_tasks.pop((ctx.guild.id, user.id), None)
+    if task and not task.done():
+        task.cancel()
+    await ctx.send(tr(ctx.channel.id, f"🔓 {user.mention} has been unbanned.", f"🔓 Đã unban {user.mention}."))
 
 
 @bot.command(name="ban")
@@ -2989,7 +3095,9 @@ for _command in (
     caption_slash,
     avatar_slash,
     mute_slash,
+    unmute_slash,
     ban_slash,
+    unban_slash,
 ):
     _command.error(generic_app_command_error)
 
@@ -3001,7 +3109,9 @@ ai_interval.error(permission_error)
 genz_add.error(permission_error)
 gif_add.error(permission_error)
 mute_slash.error(permission_error)
+unmute_slash.error(permission_error)
 ban_slash.error(permission_error)
+unban_slash.error(permission_error)
 
 
 # =========================================================
