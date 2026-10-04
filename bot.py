@@ -1661,10 +1661,8 @@ async def ai_interval(
     await interaction.response.send_message(tr(interaction.channel.id if interaction.channel else 0, f"✅ Interval = **{interval}**\n🎲 Early reply = **10%**", f"✅ Interval = **{interval}**\n🎲 Early reply = **10%**"))
 
 
-@bot.tree.command(name="status", description="View AI status")
-async def status(interaction: discord.Interaction):
-    guild_id = interaction.guild.id
-    channel_id = interaction.channel.id if interaction.channel else 0
+def build_status_embed(guild_id, channel_id):
+    is_vi = get_language(channel_id) == LANG_VI
 
     enabled = ai_enabled.get(guild_id, False)
     channel_id_ai = ai_channels.get(guild_id)
@@ -1673,38 +1671,137 @@ async def status(interaction: discord.Interaction):
     memory = get_message_count(guild_id)
     genz_count = len(get_genz_terms(guild_id, 1000))
     gif_count = len(get_gif_keywords(guild_id))
-    channel = interaction.guild.get_channel(channel_id_ai) if channel_id_ai else None
+    guild = bot.get_guild(guild_id)
+    channel = guild.get_channel(channel_id_ai) if guild and channel_id_ai else None
 
-    if get_language(channel_id) == LANG_VI:
-        text = (
-            "**Trạng thái AI**\n\n"
-            f"Trạng thái: {'🟢 Bật' if enabled else '🔴 Tắt'}\n"
-            f"Channel AI: {channel.mention if channel else 'Chưa đặt'}\n"
-            f"Interval: {interval}\n"
-            f"Memory: {memory}\n"
-            f"Gen Z dictionary: {genz_count}\n"
-            f"GIF keywords: {gif_count}\n"
-            "Early reply: 10%\n"
-            "Direct mention: BẬT\n"
-            "Reply-to-bot: BẬT\n"
-            "Self-learning: BẬT"
-        )
-    else:
-        text = (
-            "**AI Status**\n\n"
-            f"Status: {'🟢 Enabled' if enabled else '🔴 Disabled'}\n"
-            f"AI channel: {channel.mention if channel else 'Not set'}\n"
-            f"Interval: {interval}\n"
-            f"Memory: {memory}\n"
-            f"Gen Z dictionary: {genz_count}\n"
-            f"GIF keywords: {gif_count}\n"
-            "Early reply: 10%\n"
-            "Direct mention: ON\n"
-            "Reply-to-bot: ON\n"
-            "Self-learning: ON"
-        )
+    embed = discord.Embed(
+        title="🤖 TOILIX STATUS" if not is_vi else "🤖 TOILIX TRẠNG THÁI",
+        description=(
+            "Current AI and learning status for this server."
+            if not is_vi else
+            "Trạng thái AI và hệ thống học của server hiện tại."
+        ),
+        color=discord.Color.from_rgb(43, 45, 49),
+    )
 
-    await interaction.response.send_message(text)
+    embed.add_field(
+        name="🤖 AI",
+        value=(
+            f"**Status:** {'🟢 Enabled' if enabled else '🔴 Disabled'}\n"
+            f"**AI channel:** {channel.mention if channel else 'Not set'}\n"
+            f"**Interval:** `{interval}`"
+            if not is_vi else
+            f"**Trạng thái:** {'🟢 Bật' if enabled else '🔴 Tắt'}\n"
+            f"**Kênh AI:** {channel.mention if channel else 'Chưa đặt'}\n"
+            f"**Interval:** `{interval}`"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="🧠 Learning & Memory" if not is_vi else "🧠 Học & Memory",
+        value=(
+            f"**Memory messages:** `{memory}`\n"
+            f"**Gen Z dictionary:** `{genz_count}`\n"
+            f"**GIF keywords:** `{gif_count}`"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="⚙️ Behavior" if not is_vi else "⚙️ Hoạt động",
+        value=(
+            "**Early reply:** `10%`\n"
+            "**Direct mention:** `ON`\n"
+            "**Reply-to-bot:** `ON`\n"
+            "**Self-learning:** `ON`"
+            if not is_vi else
+            "**Trả lời sớm:** `10%`\n"
+            "**Mention trực tiếp:** `BẬT`\n"
+            "**Reply-to-bot:** `BẬT`\n"
+            "**Tự học:** `BẬT`"
+        ),
+        inline=False,
+    )
+
+    embed.set_footer(
+        text=(
+            "TOILIX • Use /ai_memory to view channel memory."
+            if not is_vi else
+            "TOILIX • Dùng /ai_memory để xem memory của channel này."
+        )
+    )
+    return embed
+
+
+def build_memory_embed(guild_id, channel_id):
+    is_vi = get_language(channel_id) == LANG_VI
+
+    summary = get_summary(guild_id, channel_id)
+    facts = get_facts(guild_id, channel_id, 15)
+    genz = get_genz_terms(guild_id, 15)
+
+    embed = discord.Embed(
+        title="🧠 TOILIX AI MEMORY",
+        description=(
+            "Long-term memory learned in this channel only."
+            if not is_vi else
+            "Memory dài hạn được học riêng trong channel này."
+        ),
+        color=discord.Color.from_rgb(43, 45, 49),
+    )
+
+    summary_text = summary.strip() if summary else ("None yet." if not is_vi else "Chưa có.")
+    if len(summary_text) > 1000:
+        summary_text = summary_text[:997] + "..."
+
+    facts_text = (
+        "".join(f"• **{username}:** {fact}\n" for _, username, fact in facts).strip()
+        if facts else ("None yet." if not is_vi else "Chưa có.")
+    )
+    if len(facts_text) > 1000:
+        facts_text = facts_text[:997] + "..."
+
+    genz_text = (
+        "".join(f"• `{term}` = {meaning}\n" for term, meaning, _, _, _ in genz).strip()
+        if genz else ("None yet." if not is_vi else "Chưa có.")
+    )
+    if len(genz_text) > 1000:
+        genz_text = genz_text[:997] + "..."
+
+    embed.add_field(
+        name="📖 Summary",
+        value=summary_text,
+        inline=False,
+    )
+    embed.add_field(
+        name="📝 Facts",
+        value=facts_text,
+        inline=False,
+    )
+    embed.add_field(
+        name="🗣️ Gen Z Dictionary" if not is_vi else "🗣️ Từ điển Gen Z",
+        value=genz_text,
+        inline=False,
+    )
+
+    embed.set_footer(
+        text=(
+            "Only memory from the current channel is shown."
+            if not is_vi else
+            "Chỉ hiển thị memory của channel hiện tại."
+        )
+    )
+    return embed
+
+
+@bot.tree.command(name="status", description="View AI status")
+async def status(interaction: discord.Interaction):
+    guild_id = interaction.guild.id
+    channel_id = interaction.channel.id if interaction.channel else 0
+    await interaction.response.send_message(
+        embed=build_status_embed(guild_id, channel_id)
+    )
 
 
 @bot.tree.command(
@@ -1714,29 +1811,9 @@ async def status(interaction: discord.Interaction):
 async def ai_memory(interaction: discord.Interaction):
     guild_id = interaction.guild.id
     channel_id = interaction.channel.id if interaction.channel else 0
-
-    summary = get_summary(guild_id, channel_id)
-    facts = get_facts(guild_id, channel_id, 15)
-    genz = get_genz_terms(guild_id, 15)
-
-    if get_language(channel_id) == LANG_VI:
-        text = "🧠 **AI MEMORY**\n\n"
-        text += "**Summary:**\n"
-        text += summary[:1200] if summary else "Chưa có."
-        text += "\n\n**Facts:**\n"
-        text += "".join(f"• {username}: {fact}\n" for _, username, fact in facts) if facts else "Chưa có."
-        text += "\n**Gen Z:**\n"
-        text += "".join(f"• `{term}` = {meaning}\n" for term, meaning, _, _, _ in genz) if genz else "Chưa có."
-    else:
-        text = "🧠 **AI MEMORY**\n\n"
-        text += "**Summary:**\n"
-        text += summary[:1200] if summary else "None yet."
-        text += "\n\n**Facts:**\n"
-        text += "".join(f"• {username}: {fact}\n" for _, username, fact in facts) if facts else "None yet."
-        text += "\n**Gen Z:**\n"
-        text += "".join(f"• `{term}` = {meaning}\n" for term, meaning, _, _, _ in genz) if genz else "None yet."
-
-    await interaction.response.send_message(text[:1900])
+    await interaction.response.send_message(
+        embed=build_memory_embed(guild_id, channel_id)
+    )
 
 
 @bot.tree.command(
@@ -2801,60 +2878,12 @@ async def ai_interval_prefix(ctx, interval: int):
 
 @bot.command(name="status")
 async def status_prefix(ctx):
-    guild_id = ctx.guild.id
-    channel_id = ctx.channel.id
-    enabled = ai_enabled.get(guild_id, False)
-    ai_channel_id = ai_channels.get(guild_id)
-    interval = reply_intervals.get(guild_id, DEFAULT_INTERVAL)
-    memory = get_message_count(guild_id)
-    genz_count = len(get_genz_terms(guild_id, 1000))
-    gif_count = len(get_gif_keywords(guild_id))
-    channel = ctx.guild.get_channel(ai_channel_id) if ai_channel_id else None
-
-    if get_language(channel_id) == LANG_VI:
-        text = (
-            "**Trạng thái AI**\n\n"
-            f"Trạng thái: {'🟢 Bật' if enabled else '🔴 Tắt'}\n"
-            f"Channel AI: {channel.mention if channel else 'Chưa đặt'}\n"
-            f"Interval: {interval}\nMemory: {memory}\n"
-            f"Gen Z dictionary: {genz_count}\nGIF keywords: {gif_count}\n"
-            "Early reply: 10%\nDirect mention: BẬT\nReply-to-bot: BẬT\nSelf-learning: BẬT"
-        )
-    else:
-        text = (
-            "**AI Status**\n\n"
-            f"Status: {'🟢 Enabled' if enabled else '🔴 Disabled'}\n"
-            f"AI channel: {channel.mention if channel else 'Not set'}\n"
-            f"Interval: {interval}\nMemory: {memory}\n"
-            f"Gen Z dictionary: {genz_count}\nGIF keywords: {gif_count}\n"
-            "Early reply: 10%\nDirect mention: ON\nReply-to-bot: ON\nSelf-learning: ON"
-        )
-    await ctx.send(text)
+    await ctx.send(embed=build_status_embed(ctx.guild.id, ctx.channel.id))
 
 
 @bot.command(name="ai_memory")
 async def ai_memory_prefix(ctx):
-    guild_id = ctx.guild.id
-    channel_id = ctx.channel.id
-    summary = get_summary(guild_id, channel_id)
-    facts = get_facts(guild_id, channel_id, 15)
-    genz = get_genz_terms(guild_id, 15)
-
-    if get_language(channel_id) == LANG_VI:
-        text = "🧠 **AI MEMORY**\n\n**Summary:**\n"
-        text += summary[:1200] if summary else "Chưa có."
-        text += "\n\n**Facts:**\n"
-        text += "".join(f"• {username}: {fact}\n" for _, username, fact in facts) if facts else "Chưa có.\n"
-        text += "\n**Gen Z:**\n"
-        text += "".join(f"• `{term}` = {meaning}\n" for term, meaning, _, _, _ in genz) if genz else "Chưa có."
-    else:
-        text = "🧠 **AI MEMORY**\n\n**Summary:**\n"
-        text += summary[:1200] if summary else "None yet."
-        text += "\n\n**Facts:**\n"
-        text += "".join(f"• {username}: {fact}\n" for _, username, fact in facts) if facts else "None yet.\n"
-        text += "\n**Gen Z:**\n"
-        text += "".join(f"• `{term}` = {meaning}\n" for term, meaning, _, _, _ in genz) if genz else "None yet."
-    await ctx.send(text[:1900])
+    await ctx.send(embed=build_memory_embed(ctx.guild.id, ctx.channel.id))
 
 
 @bot.command(name="genz_add")
