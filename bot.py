@@ -30,6 +30,7 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 SUPPORT_CHANNEL_ID = int(os.getenv("SUPPORT_CHANNEL_ID", "0") or 0)
+BOT_OWNER_ID = 1013140093105623060
 
 # FREE: giữ AI cũ của bot (Gemini).
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
@@ -1515,6 +1516,68 @@ async def on_ready():
 # SLASH COMMANDS
 # =========================================================
 
+def owner_profile_link(owner):
+    """Return a real Discord user mention for the bot owner."""
+    return owner.mention
+
+
+@bot.tree.command(name="owner", description="Show the bot owner")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def owner_slash(interaction: discord.Interaction):
+    try:
+        owner = bot.get_user(BOT_OWNER_ID)
+        if owner is None:
+            owner = await bot.fetch_user(BOT_OWNER_ID)
+
+        link = owner_profile_link(owner)
+        await interaction.response.send_message(
+            tr(
+                interaction.channel.id if interaction.channel else 0,
+                f"👑 **Bot Owner:** {link}",
+                f"👑 **Chủ bot:** {link}",
+            ),
+            silent=True,
+        )
+    except Exception as e:
+        print("[OWNER COMMAND ERROR]", repr(e))
+        await interaction.response.send_message(
+            tr(
+                interaction.channel.id if interaction.channel else 0,
+                "❌ Could not retrieve the bot owner.",
+                "❌ Không thể lấy thông tin chủ bot.",
+            ),
+            ephemeral=True,
+        )
+
+
+@bot.command(name="owner")
+@commands.has_guild_permissions(manage_guild=True)
+async def owner_prefix(ctx):
+    try:
+        owner = bot.get_user(BOT_OWNER_ID)
+        if owner is None:
+            owner = await bot.fetch_user(BOT_OWNER_ID)
+
+        link = owner_profile_link(owner)
+        await ctx.send(
+            tr(
+                ctx.channel.id,
+                f"👑 **Bot Owner:** {link}",
+                f"👑 **Chủ bot:** {link}",
+            ),
+            silent=True,
+        )
+    except Exception as e:
+        print("[OWNER COMMAND ERROR]", repr(e))
+        await ctx.send(
+            tr(
+                ctx.channel.id,
+                "❌ Could not retrieve the bot owner.",
+                "❌ Không thể lấy thông tin chủ bot.",
+            )
+        )
+
+
 @bot.tree.command(name="language", description="Choose the bot language for this channel")
 @app_commands.describe(language="Choose English or Vietnamese")
 @app_commands.choices(language=[
@@ -1900,6 +1963,7 @@ def build_help_embed(channel_id):
 
     descriptions = {
         "help": ("Show all commands.", "Xem toàn bộ lệnh."),
+        "owner": ("Show the bot owner.", "Hiển thị chủ bot."),
         "language": ("Set the language for this channel.", "Đặt ngôn ngữ cho channel này."),
         "ai_on": ("Enable AI.", "Bật AI."),
         "ai_off": ("Disable AI.", "Tắt AI."),
@@ -1929,7 +1993,7 @@ def build_help_embed(channel_id):
         "🛡️ Moderation": ["mute", "ban"],
         "🎨 Media": ["caption", "avatar", "gif", "gif_add"],
         "🧠 Learning": ["genz_add"],
-        "💎 Premium & Support": ["premium", "premium_add", "premium_remove", "support"],
+        "💎 Premium & Support": ["premium", "premium_add", "premium_remove", "support", "owner"],
     }
 
     embed = discord.Embed(
@@ -3140,6 +3204,7 @@ for _command in (
     _command.error(generic_app_command_error)
 
 
+owner_slash.error(permission_error)
 ai_on.error(permission_error)
 ai_off.error(permission_error)
 ai_channel.error(permission_error)
