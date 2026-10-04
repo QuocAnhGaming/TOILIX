@@ -47,7 +47,8 @@ EARLY_REPLY_CHANCE = 0.10
 DB_FILE = os.getenv("DB_FILE", "memory.db")
 
 MEMORY_TRIGGER = 270
-MEMORY_KEEP = 100
+# Khi compact memory: giữ lại khoảng 1/4 số tin nhắn gần nhất.
+MEMORY_KEEP = 68
 MAX_LEARNED_FACTS = 100
 MAX_GENZ_TERMS = 300
 
@@ -252,9 +253,9 @@ PLAN_STANDARD = "standard"
 PLAN_PREMIUM = "premium"
 PLAN_ORDER = {PLAN_FREE: 0, PLAN_STANDARD: 1, PLAN_PREMIUM: 2}
 TIER_LIMITS = {
-    PLAN_FREE: {"min_interval": 5, "max_interval": 15, "memory_trigger": 270, "memory_keep": 100, "max_facts": 100, "max_genz": 300, "recent": 35, "facts": 100, "genz": 120, "gifs": 25},
-    PLAN_STANDARD: {"min_interval": 3, "max_interval": 12, "memory_trigger": 400, "memory_keep": 180, "max_facts": 200, "max_genz": 500, "recent": 60, "facts": 160, "genz": 220, "gifs": 40},
-    PLAN_PREMIUM: {"min_interval": 2, "max_interval": 10, "memory_trigger": 600, "memory_keep": 300, "max_facts": 500, "max_genz": 800, "recent": 100, "facts": 300, "genz": 350, "gifs": 60},
+    PLAN_FREE: {"min_interval": 5, "max_interval": 15, "memory_trigger": 270, "memory_keep": 68, "max_facts": 100, "max_genz": 300, "recent": 35, "facts": 100, "genz": 120, "gifs": 25},
+    PLAN_STANDARD: {"min_interval": 3, "max_interval": 12, "memory_trigger": 400, "memory_keep": 100, "max_facts": 200, "max_genz": 500, "recent": 60, "facts": 160, "genz": 220, "gifs": 40},
+    PLAN_PREMIUM: {"min_interval": 2, "max_interval": 10, "memory_trigger": 600, "memory_keep": 150, "max_facts": 500, "max_genz": 800, "recent": 100, "facts": 300, "genz": 350, "gifs": 60},
 }
 
 def get_plan(guild_id):
@@ -1127,8 +1128,14 @@ Chỉ trả về summary mới, ngắn gọn.
 
     new_summary = await ask_ai_async(guild_id, prompt)
 
-    if new_summary:
-        save_summary(guild_id, channel_id, new_summary)
+    # Chỉ xóa tin cũ sau khi Summary được tạo thành công.
+    # Nếu Gemini/OpenAI lỗi (ví dụ HTTP 429), giữ nguyên memory để tránh mất dữ liệu.
+    if not new_summary:
+        conn.close()
+        print(f"[MEMORY] Summary failed; kept {len(rows)} old messages in {guild_id}/{channel_id}")
+        return
+
+    save_summary(guild_id, channel_id, new_summary)
 
     ids = [row[0] for row in rows]
     placeholders = ",".join("?" for _ in ids)
@@ -1141,7 +1148,7 @@ Chỉ trả về summary mới, ngắn gọn.
     conn.commit()
     conn.close()
 
-    print(f"[MEMORY] Compacted {len(rows)} messages in {guild_id}")
+    print(f"[MEMORY] Compacted {len(rows)} messages in {guild_id}/{channel_id}; kept {count - len(rows)}")
 
 
 # =========================================================
