@@ -89,7 +89,8 @@ bot.remove_command("help")
 # =========================================================
 
 ai_enabled = {}
-ai_channels = {}
+ai_channels = {}  # Legacy: most recently configured channel per server
+ai_channel_states = {}  # (guild_id, channel_id) -> enabled
 reply_intervals = {}
 message_counts = {}
 learning_tasks = {}
@@ -212,6 +213,21 @@ def init_db():
             ai_channel_id INTEGER,
             reply_interval INTEGER DEFAULT 6
         )
+    """)
+
+    # Per-channel AI configuration; adding a channel must not replace another.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS ai_channel_settings (
+            guild_id INTEGER NOT NULL,
+            channel_id INTEGER NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY (guild_id, channel_id)
+        )
+    """)
+    cur.execute("""
+        INSERT OR IGNORE INTO ai_channel_settings (guild_id, channel_id, enabled)
+        SELECT guild_id, ai_channel_id, ai_enabled FROM settings
+        WHERE ai_channel_id IS NOT NULL
     """)
 
     # Language is stored per channel. Migrate the old guild-level table safely.
@@ -423,6 +439,24 @@ def load_settings():
         reply_intervals[guild_id] = interval
         message_counts[guild_id] = 0
 
+    for guild_id, channel_id, enabled in cur.execute(
+        "SELECT guild_id, channel_id, enabled FROM ai_channel_settings"
+    ).fetchall():
+        ai_channel_states[(guild_id, channel_id)] = bool(enabled)
+
+    conn.close()
+
+
+def save_ai_channel_state(guild_id, channel_id, enabled):
+    ai_channel_states[(guild_id, channel_id)] = bool(enabled)
+    conn = get_db()
+    conn.execute(
+        """INSERT INTO ai_channel_settings (guild_id, channel_id, enabled)
+           VALUES (?, ?, ?)
+           ON CONFLICT(guild_id, channel_id) DO UPDATE SET enabled=excluded.enabled""",
+        (guild_id, channel_id, 1 if enabled else 0),
+    )
+    conn.commit()
     conn.close()
 
 
@@ -1723,12 +1757,13 @@ async def ai_channel(
 ):
     guild_id = interaction.guild.id
 
-    # Always remember the selected channel. False only disables AI replies.
-    ai_channels[guild_id] = channel.id
-    ai_enabled[guild_id] = enabled
+    # Configure this channel independently; never overwrite other channels.
+    ai_channels[guild_id] = channel.id  # legacy/status display only
+    save_ai_channel_state(guild_id, channel.id, enabled)
     if enabled:
+        ai_enabled[guild_id] = True
         reply_intervals.setdefault(guild_id, DEFAULT_INTERVAL)
-        message_counts[guild_id] = 0
+        message_counts[(guild_id, channel.id)] = 0
 
     save_settings(guild_id)
 
@@ -2951,11 +2986,12 @@ async def ai_off_prefix(ctx):
 async def ai_channel_prefix(ctx, channel: discord.TextChannel, enabled: bool):
     guild_id = ctx.guild.id
 
-    ai_channels[guild_id] = channel.id
-    ai_enabled[guild_id] = enabled
+    ai_channels[guild_id] = channel.id  # legacy/status display only
+    save_ai_channel_state(guild_id, channel.id, enabled)
     if enabled:
+        ai_enabled[guild_id] = True
         reply_intervals.setdefault(guild_id, DEFAULT_INTERVAL)
-        message_counts[guild_id] = 0
+        message_counts[(guild_id, channel.id)] = 0
 
     save_settings(guild_id)
 
@@ -3110,7 +3146,11 @@ async def on_message(message: discord.Message):
         await bot.process_commands(message)
         return
 
-    if ai_channels.get(guild_id) != channel_id:
+    channel_state = ai_channel_states.get((guild_id, channel_id))
+    if channel_state is None:
+        # Backward compatibility for any legacy channel not yet migrated.
+        channel_state = ai_channels.get(guild_id) == channel_id
+    if not channel_state:
         await bot.process_commands(message)
         return
 
@@ -3130,12 +3170,13 @@ async def on_message(message: discord.Message):
 
     direct = mentioned or replied_to_bot
 
+    counter_key = (guild_id, channel_id)
     if direct:
-        message_counts[guild_id] = 0
+        message_counts[counter_key] = 0
         should_reply = True
     else:
-        count = message_counts.get(guild_id, 0) + 1
-        message_counts[guild_id] = count
+        count = message_counts.get(counter_key, 0) + 1
+        message_counts[counter_key] = count
 
         interval = reply_intervals.get(
             guild_id,
@@ -3148,7 +3189,7 @@ async def on_message(message: discord.Message):
         )
 
         if should_reply:
-            message_counts[guild_id] = 0
+            message_counts[counter_key] = 0
 
     if not should_reply:
         await bot.process_commands(message)
