@@ -3029,6 +3029,16 @@ async def ai_interval_prefix(ctx, interval: int):
     await ctx.send(tr(ctx.channel.id, f"✅ Interval = **{interval}**\n🎲 Early reply = **10%**", f"✅ Interval = **{interval}**\n🎲 Early reply = **10%**"))
 
 
+@bot.tree.command(name="status", description="View AI status")
+async def status_slash(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
+        return
+    guild_id = interaction.guild.id
+    channel_id = interaction.channel.id if interaction.channel else 0
+    await interaction.response.send_message(embed=build_status_embed(guild_id, channel_id))
+
+
 @bot.command(name="status")
 async def status_prefix(ctx):
     await ctx.send(embed=build_status_embed(ctx.guild.id, ctx.channel.id))
