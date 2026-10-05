@@ -49,6 +49,18 @@ AUTO_ROLE_ID = _env_int("AUTO_ROLE_ID")
 # FREE: giữ AI cũ của bot (Gemini).
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b").strip()
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "").strip()
+MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "mistral-small-latest").strip()
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free").strip()
+COHERE_API_KEY = os.getenv("COHERE_API_KEY", "").strip()
+COHERE_MODEL = os.getenv("COHERE_MODEL", "command-r7b-12-2024").strip()
+
+# Free-AI queue: one message at a time, FIFO.
+AI_THINK_DELAY = 2.0
+AI_MESSAGE_COOLDOWN = 3.0
 
 # STANDARD/PREMIUM: AI mới qua OpenAI. Đổi model bằng .env.
 STANDARD_MODEL = os.getenv("STANDARD_MODEL", "gpt-6-sol")
@@ -96,16 +108,11 @@ message_counts = {}
 learning_tasks = {}
 temporary_ban_tasks = {}
 
-# AI response queue:
-# - One global FIFO queue for all AI-enabled channels/users.
-# - Requests are ordered by the Discord message timestamp, then by arrival sequence.
-# - The bot waits ~2 seconds before sending each request to the AI API.
-# - After each completed response, it waits ~3 seconds before processing the next one.
-AI_THINK_DELAY = 2.0
-AI_MESSAGE_GAP = 3.0
-ai_request_queue = asyncio.PriorityQueue()
+# Global FIFO queue for AI replies. Every AI-triggered message waits its turn.
+ai_reply_queue = asyncio.Queue()
 ai_queue_worker_task = None
-ai_queue_sequence = 0
+free_ai_index = 0
+free_ai_lock = asyncio.Lock()
 
 
 # =========================================================
@@ -1030,70 +1037,134 @@ def get_gif_keywords(guild_id):
 # AI BACKENDS
 # =========================================================
 
-def ask_gemini(prompt):
-    """Free AI backend. Uses Gemini API through HTTPS; no Gemini/OpenAI required."""
-    if not GEMINI_API_KEY:
-        print("[GEMINI ERROR] GEMINI_API_KEY is missing.")
-        return None
-
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{GEMINI_MODEL}:generateContent"
-    )
-    payload = {
-        "contents": [
-            {
-                "role": "user",
-                "parts": [{"text": prompt}],
-            }
-        ],
-        "generationConfig": {
-            "temperature": 0.75,
-            "topP": 0.9,
-        },
-    }
-
+def _post_json(url, *, headers=None, params=None, payload=None, label="AI"):
     try:
         response = requests.post(
             url,
-            params={"key": GEMINI_API_KEY},
-            json=payload,
+            headers=headers or {},
+            params=params or {},
+            json=payload or {},
             timeout=120,
         )
-
         if response.status_code != 200:
             try:
                 detail = response.json().get("error", {}).get("message", response.text)
             except Exception:
                 detail = response.text
-            print(f"[GEMINI ERROR] HTTP {response.status_code}: {detail}")
+            print(f"[{label} ERROR] HTTP {response.status_code}: {detail}")
             return None
-
-        data = response.json()
-        candidates = data.get("candidates") or []
-        if not candidates:
-            print("[GEMINI ERROR] No candidates returned:", data)
-            return None
-
-        parts = candidates[0].get("content", {}).get("parts", [])
-        answer = "".join(
-            part.get("text", "")
-            for part in parts
-            if isinstance(part, dict)
-        ).strip()
-
-        if not answer:
-            print("[GEMINI ERROR] Empty text returned:", data)
-            return None
-
-        return answer
-
+        return response.json()
     except requests.RequestException as e:
-        print("[GEMINI ERROR] Network:", repr(e))
+        print(f"[{label} ERROR] Network: {e!r}")
         return None
     except Exception as e:
-        print("[GEMINI ERROR]", repr(e))
+        print(f"[{label} ERROR] {e!r}")
         return None
+
+
+def ask_gemini(prompt):
+    if not GEMINI_API_KEY:
+        print("[GEMINI] skipped: GEMINI_API_KEY is missing.")
+        return None
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.75, "topP": 0.9},
+    }
+    data = _post_json(url, params={"key": GEMINI_API_KEY}, payload=payload, label="GEMINI")
+    if not data:
+        return None
+    candidates = data.get("candidates") or []
+    if not candidates:
+        print("[GEMINI ERROR] No candidates returned.")
+        return None
+    answer = "".join(
+        part.get("text", "")
+        for part in candidates[0].get("content", {}).get("parts", [])
+        if isinstance(part, dict)
+    ).strip()
+    return answer or None
+
+
+def ask_groq(prompt):
+    if not GROQ_API_KEY:
+        print("[GROQ] skipped: GROQ_API_KEY is missing.")
+        return None
+    data = _post_json(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+        payload={"model": GROQ_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0.75},
+        label="GROQ",
+    )
+    if not data:
+        return None
+    choices = data.get("choices") or []
+    if not choices:
+        return None
+    return (choices[0].get("message", {}).get("content") or "").strip() or None
+
+
+def ask_mistral(prompt):
+    if not MISTRAL_API_KEY:
+        print("[MISTRAL] skipped: MISTRAL_API_KEY is missing.")
+        return None
+    data = _post_json(
+        "https://api.mistral.ai/v1/chat/completions",
+        headers={"Authorization": f"Bearer {MISTRAL_API_KEY}", "Content-Type": "application/json"},
+        payload={"model": MISTRAL_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0.75},
+        label="MISTRAL",
+    )
+    if not data:
+        return None
+    choices = data.get("choices") or []
+    if not choices:
+        return None
+    return (choices[0].get("message", {}).get("content") or "").strip() or None
+
+
+def ask_openrouter(prompt):
+    if not OPENROUTER_API_KEY:
+        print("[OPENROUTER] skipped: OPENROUTER_API_KEY is missing.")
+        return None
+    data = _post_json(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://discord.com/",
+            "X-Title": "TOILIX",
+        },
+        payload={"model": OPENROUTER_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0.75},
+        label="OPENROUTER",
+    )
+    if not data:
+        return None
+    choices = data.get("choices") or []
+    if not choices:
+        return None
+    return (choices[0].get("message", {}).get("content") or "").strip() or None
+
+
+def ask_cohere(prompt):
+    if not COHERE_API_KEY:
+        print("[COHERE] skipped: COHERE_API_KEY is missing.")
+        return None
+    data = _post_json(
+        "https://api.cohere.com/v2/chat",
+        headers={"Authorization": f"Bearer {COHERE_API_KEY}", "Content-Type": "application/json"},
+        payload={"model": COHERE_MODEL, "messages": [{"role": "user", "content": prompt}]},
+        label="COHERE",
+    )
+    if not data:
+        return None
+    message = data.get("message") or {}
+    content = message.get("content") or []
+    if isinstance(content, list):
+        text_parts = [x.get("text", "") for x in content if isinstance(x, dict)]
+        return "".join(text_parts).strip() or None
+    if isinstance(content, str):
+        return content.strip() or None
+    return None
 
 
 def ask_openai(prompt, model):
@@ -1105,16 +1176,46 @@ def ask_openai(prompt, model):
             model=model,
             input=[{"role": "user", "content": prompt}],
         )
-        return (response.output_text or "").strip()
+        return (response.output_text or "").strip() or None
     except Exception as e:
         print("[OPENAI ERROR]", repr(e))
+        return None
+
+
+FREE_AI_PROVIDERS = [
+    ("Gemini", ask_gemini),
+    ("Groq", ask_groq),
+    ("Mistral", ask_mistral),
+    ("OpenRouter", ask_openrouter),
+    ("Cohere", ask_cohere),
+]
+
+
+async def ask_free_ai_with_fallback(prompt):
+    """Try the 5 free providers in a rotating loop until one answers."""
+    global free_ai_index
+    async with free_ai_lock:
+        start_index = free_ai_index % len(FREE_AI_PROVIDERS)
+        for offset in range(len(FREE_AI_PROVIDERS)):
+            index = (start_index + offset) % len(FREE_AI_PROVIDERS)
+            name, backend = FREE_AI_PROVIDERS[index]
+            print(f"[FREE AI] Trying {name} ({index + 1}/5)")
+            answer = await asyncio.to_thread(backend, prompt)
+            if answer:
+                free_ai_index = index
+                print(f"[FREE AI] {name} answered successfully.")
+                return answer
+            print(f"[FREE AI] {name} failed/exhausted -> next AI.")
+
+        # Keep the loop moving: the next request starts from AI #1 again.
+        free_ai_index = (start_index + 1) % len(FREE_AI_PROVIDERS)
         return None
 
 
 async def ask_ai_async(guild_id, prompt):
     plan = get_plan(guild_id)
     if plan == PLAN_FREE:
-        return await asyncio.to_thread(ask_gemini, prompt)
+        return await ask_free_ai_with_fallback(prompt)
     return await asyncio.to_thread(ask_openai, prompt, plan_model(guild_id))
 
 # =========================================================
@@ -1534,111 +1635,6 @@ async def send_ai_response(message, answer):
 
 
 # =========================================================
-# AI REQUEST QUEUE
-# =========================================================
-
-async def ai_request_worker():
-    """Process AI replies one at a time in message order."""
-    global ai_queue_sequence
-
-    while True:
-        _, _, message, guild_id, prompt = await ai_request_queue.get()
-
-        try:
-            # Short thinking delay before every API request.
-            async with message.channel.typing():
-                await asyncio.sleep(AI_THINK_DELAY)
-                answer = await ask_ai_async(guild_id, prompt)
-
-                if not answer:
-                    if get_plan(guild_id) == PLAN_FREE:
-                        error_en = (
-                            "⚠️ Gemini did not return a response. Check GEMINI_API_KEY, "
-                            "the Gemini model, or the API quota."
-                        )
-                        error_vi = (
-                            "⚠️ Gemini không trả về phản hồi. Hãy kiểm tra GEMINI_API_KEY, "
-                            "model Gemini hoặc giới hạn API."
-                        )
-                    else:
-                        error_en = (
-                            "⚠️ Premium AI did not return a response. Check OPENAI_API_KEY, "
-                            "the OpenAI model, or the API quota."
-                        )
-                        error_vi = (
-                            "⚠️ Premium AI không trả về phản hồi. Hãy kiểm tra OPENAI_API_KEY, "
-                            "model OpenAI hoặc giới hạn API."
-                        )
-
-                    await message.channel.send(
-                        tr(message.channel.id, error_en, error_vi)
-                    )
-                else:
-                    await send_ai_response(message, answer)
-
-                    task = asyncio.create_task(learn_from_message(message))
-                    learning_tasks.setdefault(guild_id, set())
-                    learning_tasks[guild_id].add(task)
-
-                    def _remove_learning_task(t, gid=guild_id):
-                        learning_tasks.setdefault(gid, set()).discard(t)
-
-                    task.add_done_callback(_remove_learning_task)
-
-        except Exception as e:
-            print("[AI QUEUE ERROR]", repr(e))
-            try:
-                await message.channel.send(
-                    tr(
-                        message.channel.id,
-                        "⚠️ An error occurred while processing AI.",
-                        "⚠️ Có lỗi khi xử lý AI.",
-                    )
-                )
-            except Exception:
-                pass
-        finally:
-            ai_request_queue.task_done()
-
-            # Keep a minimum gap between completed messages.
-            await asyncio.sleep(AI_MESSAGE_GAP)
-
-
-def start_ai_queue_worker():
-    global ai_queue_worker_task
-
-    if ai_queue_worker_task is None or ai_queue_worker_task.done():
-        ai_queue_worker_task = asyncio.create_task(ai_request_worker())
-        print(
-            f"[AI QUEUE] Started | think={AI_THINK_DELAY:.1f}s | "
-            f"gap={AI_MESSAGE_GAP:.1f}s | order=message timestamp"
-        )
-
-
-async def enqueue_ai_request(message, guild_id, prompt):
-    global ai_queue_sequence
-
-    ai_queue_sequence += 1
-    created_timestamp = message.created_at.timestamp()
-
-    await ai_request_queue.put(
-        (
-            created_timestamp,
-            ai_queue_sequence,
-            message,
-            guild_id,
-            prompt,
-        )
-    )
-
-    print(
-        f"[AI QUEUE] #{ai_queue_sequence} queued | "
-        f"user={message.author} | channel={message.channel.id} | "
-        f"waiting={ai_request_queue.qsize()}"
-    )
-
-
-# =========================================================
 # AUTO ROLE
 # =========================================================
 
@@ -1683,12 +1679,11 @@ async def on_ready():
     init_db()
     load_settings()
     seed_default_genz()
+    ensure_ai_queue_worker()
     try:
         await restore_temporary_bans()
     except Exception as e:
         print("[TEMP BAN RESTORE ERROR]", repr(e))
-
-    start_ai_queue_worker()
 
     try:
         # Sync global commands. Discord may take some time to propagate global commands.
@@ -1699,7 +1694,12 @@ async def on_ready():
 
     print("=" * 55)
     print("DISCORD AI BOT ONLINE")
-    print(f"Free AI (Gemini): {GEMINI_MODEL}")
+    print(f"Free AI fallback: Gemini -> Groq -> Mistral -> OpenRouter -> Cohere")
+    print(f"  Gemini: {GEMINI_MODEL}")
+    print(f"  Groq: {GROQ_MODEL}")
+    print(f"  Mistral: {MISTRAL_MODEL}")
+    print(f"  OpenRouter: {OPENROUTER_MODEL}")
+    print(f"  Cohere: {COHERE_MODEL}")
     print(f"Standard AI: {STANDARD_MODEL}")
     print(f"Premium AI: {PREMIUM_MODEL}")
     print(f"OpenAI configured: {'YES' if openai_available() else 'NO'}")
@@ -1981,11 +1981,17 @@ def build_status_embed(guild_id, channel_id):
         name="⚙️ Behavior" if not is_vi else "⚙️ Hoạt động",
         value=(
             "**Early reply:** `10%`\n"
+            "**AI queue:** `FIFO`\n"
+            "**Think delay:** `2s`\n"
+            "**Message cooldown:** `3s`\n"
             "**Direct mention:** `ON`\n"
             "**Reply-to-bot:** `ON`\n"
             "**Self-learning:** `ON`"
             if not is_vi else
             "**Trả lời sớm:** `10%`\n"
+            "**AI queue:** `FIFO`\n"
+            "**Nghĩ:** `2s`\n"
+            "**Nghỉ mỗi tin:** `3s`\n"
             "**Mention trực tiếp:** `BẬT`\n"
             "**Reply-to-bot:** `BẬT`\n"
             "**Tự học:** `BẬT`"
@@ -3235,6 +3241,64 @@ async def on_command_error(ctx, error):
 
 
 # =========================================================
+# AI FIFO QUEUE
+# =========================================================
+
+async def process_ai_queue_job(message, prompt):
+    """Process one AI message: think ~2s, call AI, send response, then cooldown."""
+    try:
+        await asyncio.sleep(AI_THINK_DELAY)
+        async with message.channel.typing():
+            answer = await ask_ai_async(message.guild.id, prompt)
+
+        if answer:
+            await send_ai_response(message, answer)
+            task = asyncio.create_task(learn_from_message(message))
+            learning_tasks.setdefault(message.guild.id, set()).add(task)
+            task.add_done_callback(lambda t: learning_tasks[message.guild.id].discard(t))
+        else:
+            is_free = get_plan(message.guild.id) == PLAN_FREE
+            await message.channel.send(
+                tr(
+                    message.channel.id,
+                    "⚠️ All free AI providers are temporarily unavailable. Please try again later." if is_free else "⚠️ Premium AI did not return a response.",
+                    "⚠️ Tất cả AI miễn phí hiện không phản hồi. Vui lòng thử lại sau." if is_free else "⚠️ Premium AI không trả về phản hồi.",
+                )
+            )
+    except Exception as e:
+        print("[AI QUEUE ERROR]", repr(e))
+        try:
+            await message.channel.send(
+                tr(message.channel.id, "⚠️ An error occurred while processing AI.", "⚠️ Có lỗi khi xử lý AI.")
+            )
+        except Exception:
+            pass
+    finally:
+        await asyncio.sleep(AI_MESSAGE_COOLDOWN)
+
+
+async def ai_queue_worker():
+    print("[AI QUEUE] Worker started. FIFO mode ON.")
+    while True:
+        message, prompt, future = await ai_reply_queue.get()
+        try:
+            await process_ai_queue_job(message, prompt)
+            if not future.done():
+                future.set_result(True)
+        except Exception as e:
+            if not future.done():
+                future.set_exception(e)
+        finally:
+            ai_reply_queue.task_done()
+
+
+def ensure_ai_queue_worker():
+    global ai_queue_worker_task
+    if ai_queue_worker_task is None or ai_queue_worker_task.done():
+        ai_queue_worker_task = asyncio.create_task(ai_queue_worker())
+
+
+# =========================================================
 # MESSAGE EVENT
 # =========================================================
 
@@ -3313,14 +3377,17 @@ async def on_message(message: discord.Message):
         await bot.process_commands(message)
         return
 
+    ensure_ai_queue_worker()
+    prompt = build_ai_prompt(message)
+    loop = asyncio.get_running_loop()
+    future = loop.create_future()
+    await ai_reply_queue.put((message, prompt, future))
+    print(f"[AI QUEUE] +1 {message.author} in #{message.channel.name} | waiting={ai_reply_queue.qsize()}")
+
     try:
-        # Build the prompt now so the queued request keeps the context of the
-        # exact message that triggered it. The actual API call is handled by
-        # the single FIFO worker.
-        prompt = build_ai_prompt(message)
-        await enqueue_ai_request(message, guild_id, prompt)
+        await future
     except Exception as e:
-        print("[AI QUEUE ERROR]", repr(e))
+        print("[AI QUEUE WAIT ERROR]", repr(e))
 
     await bot.process_commands(message)
 
