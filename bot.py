@@ -96,6 +96,17 @@ message_counts = {}
 learning_tasks = {}
 temporary_ban_tasks = {}
 
+# AI response queue:
+# - One global FIFO queue for all AI-enabled channels/users.
+# - Requests are ordered by the Discord message timestamp, then by arrival sequence.
+# - The bot waits ~2 seconds before sending each request to the AI API.
+# - After each completed response, it waits ~3 seconds before processing the next one.
+AI_THINK_DELAY = 2.0
+AI_MESSAGE_GAP = 3.0
+ai_request_queue = asyncio.PriorityQueue()
+ai_queue_worker_task = None
+ai_queue_sequence = 0
+
 
 # =========================================================
 # DATABASE
@@ -1523,6 +1534,111 @@ async def send_ai_response(message, answer):
 
 
 # =========================================================
+# AI REQUEST QUEUE
+# =========================================================
+
+async def ai_request_worker():
+    """Process AI replies one at a time in message order."""
+    global ai_queue_sequence
+
+    while True:
+        _, _, message, guild_id, prompt = await ai_request_queue.get()
+
+        try:
+            # Short thinking delay before every API request.
+            async with message.channel.typing():
+                await asyncio.sleep(AI_THINK_DELAY)
+                answer = await ask_ai_async(guild_id, prompt)
+
+                if not answer:
+                    if get_plan(guild_id) == PLAN_FREE:
+                        error_en = (
+                            "⚠️ Gemini did not return a response. Check GEMINI_API_KEY, "
+                            "the Gemini model, or the API quota."
+                        )
+                        error_vi = (
+                            "⚠️ Gemini không trả về phản hồi. Hãy kiểm tra GEMINI_API_KEY, "
+                            "model Gemini hoặc giới hạn API."
+                        )
+                    else:
+                        error_en = (
+                            "⚠️ Premium AI did not return a response. Check OPENAI_API_KEY, "
+                            "the OpenAI model, or the API quota."
+                        )
+                        error_vi = (
+                            "⚠️ Premium AI không trả về phản hồi. Hãy kiểm tra OPENAI_API_KEY, "
+                            "model OpenAI hoặc giới hạn API."
+                        )
+
+                    await message.channel.send(
+                        tr(message.channel.id, error_en, error_vi)
+                    )
+                else:
+                    await send_ai_response(message, answer)
+
+                    task = asyncio.create_task(learn_from_message(message))
+                    learning_tasks.setdefault(guild_id, set())
+                    learning_tasks[guild_id].add(task)
+
+                    def _remove_learning_task(t, gid=guild_id):
+                        learning_tasks.setdefault(gid, set()).discard(t)
+
+                    task.add_done_callback(_remove_learning_task)
+
+        except Exception as e:
+            print("[AI QUEUE ERROR]", repr(e))
+            try:
+                await message.channel.send(
+                    tr(
+                        message.channel.id,
+                        "⚠️ An error occurred while processing AI.",
+                        "⚠️ Có lỗi khi xử lý AI.",
+                    )
+                )
+            except Exception:
+                pass
+        finally:
+            ai_request_queue.task_done()
+
+            # Keep a minimum gap between completed messages.
+            await asyncio.sleep(AI_MESSAGE_GAP)
+
+
+def start_ai_queue_worker():
+    global ai_queue_worker_task
+
+    if ai_queue_worker_task is None or ai_queue_worker_task.done():
+        ai_queue_worker_task = asyncio.create_task(ai_request_worker())
+        print(
+            f"[AI QUEUE] Started | think={AI_THINK_DELAY:.1f}s | "
+            f"gap={AI_MESSAGE_GAP:.1f}s | order=message timestamp"
+        )
+
+
+async def enqueue_ai_request(message, guild_id, prompt):
+    global ai_queue_sequence
+
+    ai_queue_sequence += 1
+    created_timestamp = message.created_at.timestamp()
+
+    await ai_request_queue.put(
+        (
+            created_timestamp,
+            ai_queue_sequence,
+            message,
+            guild_id,
+            prompt,
+        )
+    )
+
+    print(
+        f"[AI QUEUE] #{ai_queue_sequence} queued | "
+        f"user={message.author} | channel={message.channel.id} | "
+        f"waiting={ai_request_queue.qsize()}"
+    )
+
+
+# =========================================================
 # AUTO ROLE
 # =========================================================
 
@@ -1571,6 +1687,8 @@ async def on_ready():
         await restore_temporary_bans()
     except Exception as e:
         print("[TEMP BAN RESTORE ERROR]", repr(e))
+
+    start_ai_queue_worker()
 
     try:
         # Sync global commands. Discord may take some time to propagate global commands.
@@ -3196,56 +3314,13 @@ async def on_message(message: discord.Message):
         return
 
     try:
+        # Build the prompt now so the queued request keeps the context of the
+        # exact message that triggered it. The actual API call is handled by
+        # the single FIFO worker.
         prompt = build_ai_prompt(message)
-
-        async with message.channel.typing():
-            answer = await ask_ai_async(guild_id, prompt)
-
-        if not answer:
-            if get_plan(guild_id) == PLAN_FREE:
-                error_en = "⚠️ Gemini did not return a response. Check GEMINI_API_KEY, the Gemini model, or the API quota."
-                error_vi = "⚠️ Gemini không trả về phản hồi. Hãy kiểm tra GEMINI_API_KEY, model Gemini hoặc giới hạn API."
-            else:
-                error_en = "⚠️ Premium AI did not return a response. Check OPENAI_API_KEY, the OpenAI model, or the API quota."
-                error_vi = "⚠️ Premium AI không trả về phản hồi. Hãy kiểm tra OPENAI_API_KEY, model OpenAI hoặc giới hạn API."
-
-            await message.channel.send(
-                tr(message.channel.id, error_en, error_vi)
-            )
-        else:
-            await send_ai_response(
-                message,
-                answer
-            )
-
-            task = asyncio.create_task(
-                learn_from_message(message)
-            )
-
-            learning_tasks.setdefault(
-                guild_id,
-                set()
-            )
-
-            learning_tasks[guild_id].add(task)
-
-            task.add_done_callback(
-                lambda t: learning_tasks[guild_id].discard(t)
-            )
-
+        await enqueue_ai_request(message, guild_id, prompt)
     except Exception as e:
-        print("[AI ERROR]", e)
-
-        try:
-            await message.channel.send(
-                tr(
-                    message.channel.id,
-                    "⚠️ An error occurred while processing AI.",
-                    "⚠️ Có lỗi khi xử lý AI.",
-                )
-            )
-        except Exception:
-            pass
+        print("[AI QUEUE ERROR]", repr(e))
 
     await bot.process_commands(message)
 
