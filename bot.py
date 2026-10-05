@@ -3291,7 +3291,7 @@ async def generic_app_command_error(interaction, error):
 
 
 for _command in (
-    status,
+    status_slash,
     ai_memory,
     language_command,
     gif,
