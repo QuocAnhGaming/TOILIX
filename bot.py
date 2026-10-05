@@ -2,6 +2,7 @@ import os
 import random
 import sqlite3
 import asyncio
+import threading
 import re
 import textwrap
 import requests
@@ -47,20 +48,25 @@ AUTO_ROLE_GUILD_ID = _env_int("AUTO_ROLE_GUILD_ID")
 AUTO_ROLE_ID = _env_int("AUTO_ROLE_ID")
 
 # FREE: giữ AI cũ của bot (Gemini).
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b").strip()
-MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "").strip()
-MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "mistral-small-latest").strip()
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free").strip()
-COHERE_API_KEY = os.getenv("COHERE_API_KEY", "").strip()
-COHERE_MODEL = os.getenv("COHERE_MODEL", "command-r7b-12-2024").strip()
+# Gemini Free: hỗ trợ tối đa 100 API key và tự chuyển key khi quota/rate-limit hết.
+# Nếu .env cũ chỉ có GEMINI_API_KEY thì vẫn dùng được bình thường.
+GEMINI_API_KEYS = []
+for _i in range(1, 101):
+    _key = os.getenv(f"GEMINI_API_KEY_{_i}", "").strip()
+    if _key:
+        GEMINI_API_KEYS.append((_i, _key))
 
-# Free-AI queue: one message at a time, FIFO.
-AI_THINK_DELAY = 2.0
-AI_MESSAGE_COOLDOWN = 3.0
+# Tương thích ngược: nếu chưa có GEMINI_API_KEY_1..100 thì dùng key cũ.
+if not GEMINI_API_KEYS:
+    _legacy_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if _legacy_key:
+        GEMINI_API_KEYS = [(1, _legacy_key)]
+
+# Vị trí key hiện tại. Không đổi key sau mỗi tin nhắn; chỉ chuyển khi key hiện tại
+# gặp lỗi quota/rate-limit hoặc lỗi xác thực khiến key không dùng được.
+GEMINI_KEY_INDEX = 0
+GEMINI_KEY_LOCK = threading.Lock()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
 
 # STANDARD/PREMIUM: AI mới qua OpenAI. Đổi model bằng .env.
 STANDARD_MODEL = os.getenv("STANDARD_MODEL", "gpt-6-sol")
@@ -107,12 +113,6 @@ reply_intervals = {}
 message_counts = {}
 learning_tasks = {}
 temporary_ban_tasks = {}
-
-# Global FIFO queue for AI replies. Every AI-triggered message waits its turn.
-ai_reply_queue = asyncio.Queue()
-ai_queue_worker_task = None
-free_ai_index = 0
-free_ai_lock = asyncio.Lock()
 
 
 # =========================================================
@@ -1037,133 +1037,125 @@ def get_gif_keywords(guild_id):
 # AI BACKENDS
 # =========================================================
 
-def _post_json(url, *, headers=None, params=None, payload=None, label="AI"):
-    try:
-        response = requests.post(
-            url,
-            headers=headers or {},
-            params=params or {},
-            json=payload or {},
-            timeout=120,
+def _gemini_key_snapshot():
+    """Lấy key hiện tại một cách thread-safe."""
+    if not GEMINI_API_KEYS:
+        return None, None
+    with GEMINI_KEY_LOCK:
+        index = GEMINI_KEY_INDEX % len(GEMINI_API_KEYS)
+        slot, key = GEMINI_API_KEYS[index]
+        return index, (slot, key)
+
+
+def _rotate_gemini_key(expected_index):
+    """Chuyển sang key tiếp theo, tránh ghi đè rotation của request khác."""
+    global GEMINI_KEY_INDEX
+    if not GEMINI_API_KEYS:
+        return
+    with GEMINI_KEY_LOCK:
+        if GEMINI_KEY_INDEX == expected_index:
+            GEMINI_KEY_INDEX = (GEMINI_KEY_INDEX + 1) % len(GEMINI_API_KEYS)
+            slot = GEMINI_API_KEYS[GEMINI_KEY_INDEX][0]
+            print(f"[GEMINI] Switching to API key #{slot}")
+
+
+def ask_gemini(prompt):
+    """Gemini Free backend with up to 100 rotating API keys."""
+    if not GEMINI_API_KEYS:
+        print("[GEMINI ERROR] No Gemini API key configured.")
+        return None
+
+    # Thử tối đa một vòng qua toàn bộ key. Key hiện tại được ưu tiên;
+    # chỉ chuyển key khi request thất bại do quota/rate-limit/auth.
+    tried = set()
+    while len(tried) < len(GEMINI_API_KEYS):
+        key_index, key_info = _gemini_key_snapshot()
+        if key_index is None or key_info is None:
+            return None
+
+        slot, api_key = key_info
+        if key_index in tried:
+            # Một request khác vừa rotation; lấy snapshot mới.
+            continue
+        tried.add(key_index)
+
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{GEMINI_MODEL}:generateContent"
         )
-        if response.status_code != 200:
+        payload = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [{"text": prompt}],
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.75,
+                "topP": 0.9,
+            },
+        }
+
+        try:
+            response = requests.post(
+                url,
+                params={"key": api_key},
+                json=payload,
+                timeout=120,
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+                candidates = data.get("candidates") or []
+                if not candidates:
+                    # Safety/content block không phải lỗi quota: không đổi key.
+                    feedback = data.get("promptFeedback") or {}
+                    block_reason = feedback.get("blockReason")
+                    if block_reason:
+                        print(f"[GEMINI ERROR] Request blocked: {block_reason}")
+                        return None
+                    print(f"[GEMINI ERROR] No candidates returned with key #{slot}: {data}")
+                    return None
+
+                parts = candidates[0].get("content", {}).get("parts", [])
+                answer = "".join(
+                    part.get("text", "")
+                    for part in parts
+                    if isinstance(part, dict)
+                ).strip()
+                if answer:
+                    return answer
+
+                print(f"[GEMINI ERROR] Empty response with key #{slot}.")
+                return None
+
+            # 429 = quota/rate limit: chuyển key ngay.
+            # 401/403: key có thể hết hạn/quyền không hợp lệ: cũng thử key kế tiếp.
+            if response.status_code in (401, 403, 429):
+                try:
+                    detail = response.json().get("error", {}).get("message", response.text)
+                except Exception:
+                    detail = response.text
+                print(f"[GEMINI] Key #{slot} unavailable HTTP {response.status_code}: {detail}")
+                _rotate_gemini_key(key_index)
+                continue
+
             try:
                 detail = response.json().get("error", {}).get("message", response.text)
             except Exception:
                 detail = response.text
-            print(f"[{label} ERROR] HTTP {response.status_code}: {detail}")
+            print(f"[GEMINI ERROR] HTTP {response.status_code} with key #{slot}: {detail}")
             return None
-        return response.json()
-    except requests.RequestException as e:
-        print(f"[{label} ERROR] Network: {e!r}")
-        return None
-    except Exception as e:
-        print(f"[{label} ERROR] {e!r}")
-        return None
 
+        except requests.RequestException as e:
+            print(f"[GEMINI] Network error with key #{slot}: {e!r}; trying next key.")
+            _rotate_gemini_key(key_index)
+            continue
+        except Exception as e:
+            print(f"[GEMINI ERROR] {e!r}")
+            return None
 
-def ask_gemini(prompt):
-    if not GEMINI_API_KEY:
-        print("[GEMINI] skipped: GEMINI_API_KEY is missing.")
-        return None
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-    payload = {
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.75, "topP": 0.9},
-    }
-    data = _post_json(url, params={"key": GEMINI_API_KEY}, payload=payload, label="GEMINI")
-    if not data:
-        return None
-    candidates = data.get("candidates") or []
-    if not candidates:
-        print("[GEMINI ERROR] No candidates returned.")
-        return None
-    answer = "".join(
-        part.get("text", "")
-        for part in candidates[0].get("content", {}).get("parts", [])
-        if isinstance(part, dict)
-    ).strip()
-    return answer or None
-
-
-def ask_groq(prompt):
-    if not GROQ_API_KEY:
-        print("[GROQ] skipped: GROQ_API_KEY is missing.")
-        return None
-    data = _post_json(
-        "https://api.groq.com/openai/v1/chat/completions",
-        headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-        payload={"model": GROQ_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0.75},
-        label="GROQ",
-    )
-    if not data:
-        return None
-    choices = data.get("choices") or []
-    if not choices:
-        return None
-    return (choices[0].get("message", {}).get("content") or "").strip() or None
-
-
-def ask_mistral(prompt):
-    if not MISTRAL_API_KEY:
-        print("[MISTRAL] skipped: MISTRAL_API_KEY is missing.")
-        return None
-    data = _post_json(
-        "https://api.mistral.ai/v1/chat/completions",
-        headers={"Authorization": f"Bearer {MISTRAL_API_KEY}", "Content-Type": "application/json"},
-        payload={"model": MISTRAL_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0.75},
-        label="MISTRAL",
-    )
-    if not data:
-        return None
-    choices = data.get("choices") or []
-    if not choices:
-        return None
-    return (choices[0].get("message", {}).get("content") or "").strip() or None
-
-
-def ask_openrouter(prompt):
-    if not OPENROUTER_API_KEY:
-        print("[OPENROUTER] skipped: OPENROUTER_API_KEY is missing.")
-        return None
-    data = _post_json(
-        "https://openrouter.ai/api/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://discord.com/",
-            "X-Title": "TOILIX",
-        },
-        payload={"model": OPENROUTER_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0.75},
-        label="OPENROUTER",
-    )
-    if not data:
-        return None
-    choices = data.get("choices") or []
-    if not choices:
-        return None
-    return (choices[0].get("message", {}).get("content") or "").strip() or None
-
-
-def ask_cohere(prompt):
-    if not COHERE_API_KEY:
-        print("[COHERE] skipped: COHERE_API_KEY is missing.")
-        return None
-    data = _post_json(
-        "https://api.cohere.com/v2/chat",
-        headers={"Authorization": f"Bearer {COHERE_API_KEY}", "Content-Type": "application/json"},
-        payload={"model": COHERE_MODEL, "messages": [{"role": "user", "content": prompt}]},
-        label="COHERE",
-    )
-    if not data:
-        return None
-    message = data.get("message") or {}
-    content = message.get("content") or []
-    if isinstance(content, list):
-        text_parts = [x.get("text", "") for x in content if isinstance(x, dict)]
-        return "".join(text_parts).strip() or None
-    if isinstance(content, str):
-        return content.strip() or None
+    print("[GEMINI] All configured API keys are currently unavailable/exhausted.")
     return None
 
 
@@ -1176,46 +1168,16 @@ def ask_openai(prompt, model):
             model=model,
             input=[{"role": "user", "content": prompt}],
         )
-        return (response.output_text or "").strip() or None
+        return (response.output_text or "").strip()
     except Exception as e:
         print("[OPENAI ERROR]", repr(e))
-        return None
-
-
-FREE_AI_PROVIDERS = [
-    ("Gemini", ask_gemini),
-    ("Groq", ask_groq),
-    ("Mistral", ask_mistral),
-    ("OpenRouter", ask_openrouter),
-    ("Cohere", ask_cohere),
-]
-
-
-async def ask_free_ai_with_fallback(prompt):
-    """Try the 5 free providers in a rotating loop until one answers."""
-    global free_ai_index
-    async with free_ai_lock:
-        start_index = free_ai_index % len(FREE_AI_PROVIDERS)
-        for offset in range(len(FREE_AI_PROVIDERS)):
-            index = (start_index + offset) % len(FREE_AI_PROVIDERS)
-            name, backend = FREE_AI_PROVIDERS[index]
-            print(f"[FREE AI] Trying {name} ({index + 1}/5)")
-            answer = await asyncio.to_thread(backend, prompt)
-            if answer:
-                free_ai_index = index
-                print(f"[FREE AI] {name} answered successfully.")
-                return answer
-            print(f"[FREE AI] {name} failed/exhausted -> next AI.")
-
-        # Keep the loop moving: the next request starts from AI #1 again.
-        free_ai_index = (start_index + 1) % len(FREE_AI_PROVIDERS)
         return None
 
 
 async def ask_ai_async(guild_id, prompt):
     plan = get_plan(guild_id)
     if plan == PLAN_FREE:
-        return await ask_free_ai_with_fallback(prompt)
+        return await asyncio.to_thread(ask_gemini, prompt)
     return await asyncio.to_thread(ask_openai, prompt, plan_model(guild_id))
 
 # =========================================================
@@ -1679,7 +1641,6 @@ async def on_ready():
     init_db()
     load_settings()
     seed_default_genz()
-    ensure_ai_queue_worker()
     try:
         await restore_temporary_bans()
     except Exception as e:
@@ -1694,12 +1655,7 @@ async def on_ready():
 
     print("=" * 55)
     print("DISCORD AI BOT ONLINE")
-    print(f"Free AI fallback: Gemini -> Groq -> Mistral -> OpenRouter -> Cohere")
-    print(f"  Gemini: {GEMINI_MODEL}")
-    print(f"  Groq: {GROQ_MODEL}")
-    print(f"  Mistral: {MISTRAL_MODEL}")
-    print(f"  OpenRouter: {OPENROUTER_MODEL}")
-    print(f"  Cohere: {COHERE_MODEL}")
+    print(f"Free AI (Gemini): {GEMINI_MODEL}")
     print(f"Standard AI: {STANDARD_MODEL}")
     print(f"Premium AI: {PREMIUM_MODEL}")
     print(f"OpenAI configured: {'YES' if openai_available() else 'NO'}")
@@ -1932,151 +1888,55 @@ async def ai_interval(
 
 def build_status_embed(guild_id, channel_id):
     is_vi = get_language(channel_id) == LANG_VI
-
     enabled = ai_enabled.get(guild_id, False)
     channel_id_ai = ai_channels.get(guild_id)
     interval = reply_intervals.get(guild_id, DEFAULT_INTERVAL)
-
     memory = get_message_count(guild_id)
     genz_count = len(get_genz_terms(guild_id, 1000))
     gif_count = len(get_gif_keywords(guild_id))
     guild = bot.get_guild(guild_id)
     channel = guild.get_channel(channel_id_ai) if guild and channel_id_ai else None
-
+    plan = get_plan(guild_id); lim = get_tier_limits(guild_id)
     embed = discord.Embed(
-        title="🤖 TOILIX STATUS" if not is_vi else "🤖 TOILIX TRẠNG THÁI",
-        description=(
-            "Current AI and learning status for this server."
-            if not is_vi else
-            "Trạng thái AI và hệ thống học của server hiện tại."
-        ),
-        color=discord.Color.from_rgb(43, 45, 49),
+        title="🤖 TOILIX • STATUS",
+        description=(f"**{guild.name if guild else 'Server'}**\nLive overview of AI, memory and bot systems."
+                     if not is_vi else f"**{guild.name if guild else 'Server'}**\nTổng quan hiện tại về AI, memory và hệ thống bot."),
+        color=discord.Color.from_rgb(43,45,49),
     )
-
-    embed.add_field(
-        name="🤖 AI",
-        value=(
-            f"**Status:** {'🟢 Enabled' if enabled else '🔴 Disabled'}\n"
-            f"**AI channel:** {channel.mention if channel else 'Not set'}\n"
-            f"**Interval:** `{interval}`"
-            if not is_vi else
-            f"**Trạng thái:** {'🟢 Bật' if enabled else '🔴 Tắt'}\n"
-            f"**Kênh AI:** {channel.mention if channel else 'Chưa đặt'}\n"
-            f"**Interval:** `{interval}`"
-        ),
-        inline=False,
-    )
-
-    embed.add_field(
-        name="🧠 Learning & Memory" if not is_vi else "🧠 Học & Memory",
-        value=(
-            f"**Memory messages:** `{memory}`\n"
-            f"**Gen Z dictionary:** `{genz_count}`\n"
-            f"**GIF keywords:** `{gif_count}`"
-        ),
-        inline=False,
-    )
-
-    embed.add_field(
-        name="⚙️ Behavior" if not is_vi else "⚙️ Hoạt động",
-        value=(
-            "**Early reply:** `10%`\n"
-            "**AI queue:** `FIFO`\n"
-            "**Think delay:** `2s`\n"
-            "**Message cooldown:** `3s`\n"
-            "**Direct mention:** `ON`\n"
-            "**Reply-to-bot:** `ON`\n"
-            "**Self-learning:** `ON`"
-            if not is_vi else
-            "**Trả lời sớm:** `10%`\n"
-            "**AI queue:** `FIFO`\n"
-            "**Nghĩ:** `2s`\n"
-            "**Nghỉ mỗi tin:** `3s`\n"
-            "**Mention trực tiếp:** `BẬT`\n"
-            "**Reply-to-bot:** `BẬT`\n"
-            "**Tự học:** `BẬT`"
-        ),
-        inline=False,
-    )
-
-    embed.set_footer(
-        text=(
-            "TOILIX • Use /ai_memory to view channel memory."
-            if not is_vi else
-            "TOILIX • Dùng /ai_memory để xem memory của channel này."
-        )
-    )
+    embed.add_field(name="🤖 AI", value=(
+        f"**Status**  {'🟢 Enabled' if enabled else '🔴 Disabled'}\n**Channel**  {channel.mention if channel else 'Not set'}\n**Interval**  `{interval}`  •  **Early** `10%`"
+        if not is_vi else
+        f"**Trạng thái**  {'🟢 Bật' if enabled else '🔴 Tắt'}\n**Channel**  {channel.mention if channel else 'Chưa đặt'}\n**Interval**  `{interval}`  •  **Sớm** `10%`"), inline=False)
+    embed.add_field(name="🧠 MEMORY & LEARNING" if not is_vi else "🧠 MEMORY & HỌC", value=(
+        f"**Messages** `{memory}`  •  **Gen Z** `{genz_count}`  •  **GIFs** `{gif_count}`\n**Self-learning** `ON`  •  **Channel memory** `ON`"
+        if not is_vi else
+        f"**Tin nhắn** `{memory}`  •  **Gen Z** `{genz_count}`  •  **GIF** `{gif_count}`\n**Tự học** `BẬT`  •  **Memory theo channel** `BẬT`"), inline=False)
+    embed.add_field(name="💎 PLAN", value=f"**{plan_label(plan)}**  •  AI `{plan_model(guild_id)}`\nMemory `{lim['memory_trigger']} → {lim['memory_keep']}`  •  Facts `{lim['max_facts']}`  •  Gen Z `{lim['max_genz']}`", inline=False)
+    embed.add_field(name="⚡ BEHAVIOR", value=("Direct mention `ON`  •  Reply-to-bot `ON`  •  FIFO queue `PER CHANNEL`" if not is_vi else "Mention trực tiếp `BẬT`  •  Reply-to-bot `BẬT`  •  FIFO queue `THEO CHANNEL`"), inline=False)
+    embed.set_footer(text="TOILIX • Use /ai_memory for this channel's memory." if not is_vi else "TOILIX • Dùng /ai_memory để xem memory của channel này.")
     return embed
 
 
 def build_memory_embed(guild_id, channel_id):
     is_vi = get_language(channel_id) == LANG_VI
-
-    summary = get_summary(guild_id, channel_id)
-    facts = get_facts(guild_id, channel_id, 15)
-    genz = get_genz_terms(guild_id, 15)
-
-    embed = discord.Embed(
-        title="🧠 TOILIX AI MEMORY",
-        description=(
-            "Long-term memory learned in this channel only."
-            if not is_vi else
-            "Memory dài hạn được học riêng trong channel này."
-        ),
-        color=discord.Color.from_rgb(43, 45, 49),
-    )
-
-    summary_text = summary.strip() if summary else ("None yet." if not is_vi else "Chưa có.")
-    if len(summary_text) > 1000:
-        summary_text = summary_text[:997] + "..."
-
-    facts_text = (
-        "".join(f"• **{username}:** {fact}\n" for _, username, fact in facts).strip()
-        if facts else ("None yet." if not is_vi else "Chưa có.")
-    )
-    if len(facts_text) > 1000:
-        facts_text = facts_text[:997] + "..."
-
-    genz_text = (
-        "".join(f"• `{term}` = {meaning}\n" for term, meaning, _, _, _ in genz).strip()
-        if genz else ("None yet." if not is_vi else "Chưa có.")
-    )
-    if len(genz_text) > 1000:
-        genz_text = genz_text[:997] + "..."
-
-    embed.add_field(
-        name="📖 Summary",
-        value=summary_text,
-        inline=False,
-    )
-    embed.add_field(
-        name="📝 Facts",
-        value=facts_text,
-        inline=False,
-    )
-    embed.add_field(
-        name="🗣️ Gen Z Dictionary" if not is_vi else "🗣️ Từ điển Gen Z",
-        value=genz_text,
-        inline=False,
-    )
-
-    embed.set_footer(
-        text=(
-            "Only memory from the current channel is shown."
-            if not is_vi else
-            "Chỉ hiển thị memory của channel hiện tại."
-        )
-    )
+    summary = get_summary(guild_id, channel_id); facts = get_facts(guild_id, channel_id, 15); genz = get_genz_terms(guild_id, 15)
+    enabled = ai_channel_states.get((guild_id, channel_id), ai_enabled.get(guild_id, False))
+    summary_text = summary.strip() if summary else ("No summary yet." if not is_vi else "Chưa có summary.")
+    if len(summary_text)>1000: summary_text=summary_text[:997]+"..."
+    facts_text = "".join(f"• **{username}:** {fact}\n" for _,username,fact in facts).strip() or ("No facts yet." if not is_vi else "Chưa có facts.")
+    if len(facts_text)>1000: facts_text=facts_text[:997]+"..."
+    genz_text = "".join(f"• `{term}` → {meaning}\n" for term,meaning,_,_,_ in genz).strip() or ("No Gen Z terms yet." if not is_vi else "Chưa có từ Gen Z.")
+    if len(genz_text)>1000: genz_text=genz_text[:997]+"..."
+    embed=discord.Embed(
+        title="🧠 TOILIX • MEMORY",
+        description=(f"**Channel:** <#{channel_id}>  •  {'🟢 Learning' if enabled else '🔴 Paused'}\nThis panel only shows memory learned from this channel."
+                     if not is_vi else f"**Channel:** <#{channel_id}>  •  {'🟢 Đang học' if enabled else '🔴 Tạm dừng'}\nBảng này chỉ hiển thị memory được học từ channel hiện tại."),
+        color=discord.Color.from_rgb(43,45,49))
+    embed.add_field(name="📖 SUMMARY",value=summary_text,inline=False)
+    embed.add_field(name="📝 FACTS",value=facts_text,inline=False)
+    embed.add_field(name="🗣️ GEN Z",value=genz_text,inline=False)
+    embed.set_footer(text="Old memory is kept when AI learning is disabled." if not is_vi else "Memory cũ vẫn được giữ khi tắt AI learning.")
     return embed
-
-
-@bot.tree.command(name="status", description="View AI status")
-async def status(interaction: discord.Interaction):
-    guild_id = interaction.guild.id
-    channel_id = interaction.channel.id if interaction.channel else 0
-    await interaction.response.send_message(
-        embed=build_status_embed(guild_id, channel_id)
-    )
 
 
 @bot.tree.command(
@@ -2170,89 +2030,66 @@ async def gif(
 
 
 def build_help_embed(channel_id):
-    """Build a compact Owo-style help embed with / and ! commands merged."""
+    """Build the main TOILIX help panel with grouped Owo-style sections."""
     is_vi = get_language(channel_id) == LANG_VI
-
     descriptions = {
-        "help": ("Show all commands.", "Xem toàn bộ lệnh."),
+        "help": ("Open this command panel.", "Mở bảng lệnh này."),
         "owner": ("Show the bot owner.", "Hiển thị chủ bot."),
         "language": ("Set the language for this channel.", "Đặt ngôn ngữ cho channel này."),
-        "ai_on": ("Enable AI.", "Bật AI."),
-        "ai_off": ("Disable AI.", "Tắt AI."),
-        "ai_channel": ("Set the AI channel and choose true/false.", "Chọn kênh AI và bật/tắt bằng true/false."),
-        "ai_interval": ("Set the reply interval.", "Đặt khoảng cách tin nhắn AI trả lời."),
-        "status": ("View AI status.", "Xem trạng thái AI."),
-        "ai_memory": ("View AI memory.", "Xem memory AI."),
+        "ai_on": ("Enable AI in the selected channel.", "Bật AI trong channel đã chọn."),
+        "ai_off": ("Disable AI in the selected channel.", "Tắt AI trong channel đã chọn."),
+        "ai_channel": ("Configure an AI channel and its true/false state.", "Cấu hình channel AI và trạng thái true/false."),
+        "ai_interval": ("Set the AI reply interval.", "Đặt khoảng cách tin nhắn AI trả lời."),
+        "status": ("View live bot, AI and learning status.", "Xem trạng thái bot, AI và hệ thống học."),
+        "ai_memory": ("View memory for the current channel.", "Xem memory của channel hiện tại."),
         "genz_add": ("Add slang/memes to the dictionary.", "Thêm slang/meme vào từ điển."),
-        "gif_add": ("Add a GIF URL.", "Thêm URL GIF."),
-        "gif": ("Send a GIF.", "Gửi GIF."),
+        "gif_add": ("Add a GIF URL by keyword.", "Thêm URL GIF theo từ khóa."),
+        "gif": ("Send a saved GIF.", "Gửi GIF đã lưu."),
         "caption": ("Add a caption above an image.", "Thêm caption phía trên ảnh."),
-        "avatar": ("Show an avatar.", "Hiển thị avatar."),
+        "avatar": ("Show a member avatar.", "Hiển thị avatar thành viên."),
         "support": ("Send a support request.", "Gửi yêu cầu hỗ trợ."),
-        "premium": ("View the server plan.", "Xem gói server."),
-        "premium_add": ("Owner: grant Standard/Premium.", "Owner: cấp Standard/Premium."),
+        "premium": ("View the current server plan.", "Xem gói hiện tại của server."),
+        "premium_add": ("Owner: grant Standard or Premium.", "Owner: cấp Standard hoặc Premium."),
         "premium_remove": ("Owner: return a server to Free.", "Owner: đưa server về Free."),
-        "mute": ("Temporarily mute a member.", "Mute thành viên trong một khoảng thời gian."),
-        "ban": ("Temporarily ban a member.", "Ban thành viên trong một khoảng thời gian."),
+        "mute": ("Temporarily mute a member.", "Mute thành viên trong thời gian chỉ định."),
+        "unmute": ("Remove a member's timeout.", "Gỡ mute/timeout của thành viên."),
+        "ban": ("Temporarily ban a member.", "Ban thành viên trong thời gian chỉ định."),
+        "unban": ("Unban a user by ID.", "Gỡ ban user bằng ID."),
     }
-
-    # Merge slash + prefix commands by command name.
     names = {c.name for c in bot.tree.get_commands()}
     names.update(c.name for c in bot.commands)
-
-    groups = {
-        "🤖 AI": ["help", "language", "ai_on", "ai_off", "ai_channel", "ai_interval", "status", "ai_memory"],
-        "🛡️ Moderation": ["mute", "ban"],
-        "🎨 Media": ["caption", "avatar", "gif", "gif_add"],
-        "🧠 Learning": ["genz_add"],
-        "💎 Premium & Support": ["premium", "premium_add", "premium_remove", "support", "owner"],
-    }
-
+    groups = [
+        (("🤖 AI & CHAT", "🤖 AI & CHAT"), ["help", "language", "ai_on", "ai_off", "ai_channel", "ai_interval", "status", "ai_memory"]),
+        (("🛡️ MODERATION", "🛡️ QUẢN TRỊ"), ["mute", "unmute", "ban", "unban"]),
+        (("🎨 MEDIA", "🎨 MEDIA"), ["avatar", "caption", "gif", "gif_add"]),
+        (("🧠 LEARNING", "🧠 HỌC & MEMORY"), ["genz_add"]),
+        (("💎 PREMIUM & SUPPORT", "💎 PREMIUM & SUPPORT"), ["premium", "premium_add", "premium_remove", "support"]),
+        (("⚙️ BOT", "⚙️ BOT"), ["owner"]),
+    ]
     embed = discord.Embed(
-        title="🤖 TOILIX HELP" if not is_vi else "🤖 TOILIX TRỢ GIÚP",
+        title="🤖 TOILIX",
         description=(
-            "Commands are available with both `/` and `!`."
+            "**Help Center**\nUse `/` or `!` • Commands are grouped by function.\n\n`/help` • `!help`  ·  Open this panel"
             if not is_vi else
-            "Các lệnh đều có thể dùng bằng cả `/` và `!`."
+            "**Trung tâm lệnh**\nDùng `/` hoặc `!` • Lệnh được chia theo từng chức năng.\n\n`/help` • `!help`  ·  Mở bảng này"
         ),
         color=discord.Color.from_rgb(43, 45, 49),
     )
-
-    for group_name, group_commands in groups.items():
-        entries = []
-        for name in group_commands:
-            if name not in names:
-                continue
-            en, vi = descriptions.get(name, ("Command.", "Lệnh."))
-            desc = vi if is_vi else en
-            entries.append(f"`/{name}` • `!{name}` — {desc}")
-
-        if entries:
-            embed.add_field(
-                name=group_name,
-                value="\n".join(entries),
-                inline=False
-            )
-
+    for (en_name, vi_name), command_names in groups:
+        entries=[]
+        for name in command_names:
+            if name in names:
+                en,vi=descriptions[name]
+                entries.append(f"`/{name}`  `!{name}` — {vi if is_vi else en}")
+        if entries: embed.add_field(name=vi_name if is_vi else en_name, value="\n".join(entries), inline=False)
     embed.add_field(
-        name="⏱️ Duration" if not is_vi else "⏱️ Thời gian",
-        value=(
-            "`10s` = 10 seconds • `10m` = 10 minutes • `10d` = 10 days\n"
-            "`10d10m10s` = cộng dồn nhiều đơn vị"
-            if is_vi else
-            "`10s` = 10 seconds • `10m` = 10 minutes • `10d` = 10 days\n"
-            "`10d10m10s` = combine multiple units"
-        ),
-        inline=False
+        name="⏱️ DURATION" if not is_vi else "⏱️ THỜI GIAN",
+        value=("`10s` · `10m` · `10h` · `10d`\n`10d10h10m10s` or any order such as `10h2d5m`"
+               if not is_vi else
+               "`10s` · `10m` · `10h` · `10d`\n`10d10h10m10s` hoặc ghép theo thứ tự bất kỳ như `10h2d5m`"),
+        inline=False,
     )
-
-    embed.set_footer(
-        text=(
-            "🎲 AI may reply early with a 10% chance."
-            if not is_vi else
-            "🎲 AI có 10% xác suất trả lời sớm."
-        )
-    )
+    embed.set_footer(text="TOILIX • AI may reply early with a 10% chance." if not is_vi else "TOILIX • AI có 10% xác suất trả lời sớm.")
     return embed
 
 
@@ -2379,86 +2216,31 @@ async def support_slash(
     )
 
 
+def build_premium_embed(guild_id, channel_id):
+    is_vi=get_language(channel_id)==LANG_VI; plan=get_plan(guild_id); info=get_plan_info(guild_id); lim=get_tier_limits(guild_id)
+    labels=({PLAN_FREE:"🆓 Miễn phí",PLAN_STANDARD:"🔹 Standard",PLAN_PREMIUM:"💎 Premium"} if is_vi else {PLAN_FREE:"🆓 Free",PLAN_STANDARD:"🔹 Standard",PLAN_PREMIUM:"💎 Premium"})
+    label=labels.get(plan,plan)
+    embed=discord.Embed(title="💎 TOILIX • PREMIUM",description=(f"Current server plan: **{label}**\nYour plan controls AI model and feature limits." if not is_vi else f"Gói hiện tại của server: **{label}**\nGói quyết định model AI và giới hạn tính năng."),color=discord.Color.from_rgb(43,45,49))
+    embed.add_field(name="🤖 AI",value=f"**Model** `{plan_model(guild_id)}`",inline=False)
+    embed.add_field(name="🧠 MEMORY",value=f"Trigger `{lim['memory_trigger']}`  •  Keep `{lim['memory_keep']}`\nFacts `{lim['max_facts']}`  •  Gen Z `{lim['max_genz']}`",inline=False)
+    embed.add_field(name="⚡ AI SETTINGS",value=(f"Interval `{reply_intervals.get(guild_id,DEFAULT_INTERVAL)}`  •  Early reply `10%`\n100-key Gemini fallback is available on Free." if not is_vi else f"Interval `{reply_intervals.get(guild_id,DEFAULT_INTERVAL)}`  •  Trả lời sớm `10%`\nFree có hệ thống Gemini fallback tối đa 100 key."),inline=False)
+    embed.add_field(name="⏳ EXPIRES" if not is_vi else "⏳ HẾT HẠN",value=f"`{info['expires_at']}`" if info.get('expires_at') else ("`Permanent / No expiry`" if not is_vi else "`Không có thời hạn`"),inline=False)
+    embed.set_footer(text="TOILIX • Owner-managed plan" if not is_vi else "TOILIX • Gói được quản lý bởi Owner")
+    return embed
+
+
 @bot.command(name="premium")
 async def premium_prefix(ctx):
     if not ctx.guild:
-        await ctx.send("This command can only be used in a server.")
-        return
-
-    plan = get_plan(ctx.guild.id)
-    info = get_plan_info(ctx.guild.id)
-    lim = get_tier_limits(ctx.guild.id)
-    is_vi = get_language(ctx.channel.id) == LANG_VI
-    label = (
-        {PLAN_FREE: "🆓 Free", PLAN_STANDARD: "🔹 Standard", PLAN_PREMIUM: "💎 Premium"}
-        if not is_vi else
-        {PLAN_FREE: "🆓 Miễn phí", PLAN_STANDARD: "🔹 Standard", PLAN_PREMIUM: "💎 Premium"}
-    )[plan]
-
-    if is_vi:
-        text = (
-            f"**{label}**\n"
-            f"AI: `{plan_model(ctx.guild.id)}`\n"
-            f"Memory: `{lim['memory_trigger']} → {lim['memory_keep']}`\n"
-            f"Facts: `{lim['max_facts']}`\n"
-            f"Gen Z: `{lim['max_genz']}`"
-        )
-        if info.get("expires_at"):
-            text += f"\nHết hạn: `{info['expires_at']}`"
-    else:
-        text = (
-            f"**{label}**\n"
-            f"AI: `{plan_model(ctx.guild.id)}`\n"
-            f"Memory: `{lim['memory_trigger']} → {lim['memory_keep']}`\n"
-            f"Facts: `{lim['max_facts']}`\n"
-            f"Gen Z: `{lim['max_genz']}`"
-        )
-        if info.get("expires_at"):
-            text += f"\nExpires: `{info['expires_at']}`"
-
-    await ctx.send(text)
+        await ctx.send("This command can only be used in a server."); return
+    await ctx.send(embed=build_premium_embed(ctx.guild.id,ctx.channel.id))
 
 
-@bot.tree.command(name="premium", description="View the server plan")
+@bot.tree.command(name="premium", description="View the server plan and premium status")
 async def premium_slash(interaction: discord.Interaction):
     if not interaction.guild:
-        await interaction.response.send_message(
-            "This command can only be used in a server.",
-            ephemeral=True,
-        )
-        return
-
-    guild_id = interaction.guild.id
-    channel_id = interaction.channel.id if interaction.channel else 0
-    plan = get_plan(guild_id)
-    info = get_plan_info(guild_id)
-    lim = get_tier_limits(guild_id)
-    is_vi = get_language(channel_id) == LANG_VI
-
-    embed = discord.Embed(
-        title="💎 Trạng thái Premium" if is_vi else "💎 Premium Status"
-    )
-    embed.add_field(
-        name="Gói" if is_vi else "Plan",
-        value=("🆓 Miễn phí" if is_vi and plan == PLAN_FREE else plan_label(plan)),
-        inline=True,
-    )
-    embed.add_field(name="AI", value=f"`{plan_model(guild_id)}`", inline=True)
-    embed.add_field(
-        name="Memory",
-        value=f"`{lim['memory_trigger']} → {lim['memory_keep']}`",
-        inline=False,
-    )
-    embed.add_field(name="Facts", value=str(lim["max_facts"]), inline=True)
-    embed.add_field(name="Gen Z", value=str(lim["max_genz"]), inline=True)
-    if info.get("expires_at"):
-        embed.add_field(
-            name="Hết hạn" if is_vi else "Expires",
-            value=f"`{info['expires_at']}`",
-            inline=False,
-        )
-
-    await interaction.response.send_message(embed=embed)
+        await interaction.response.send_message("This command can only be used in a server.",ephemeral=True); return
+    await interaction.response.send_message(embed=build_premium_embed(interaction.guild.id,interaction.channel.id if interaction.channel else 0))
 
 
 def valid_plan(plan):
@@ -2557,46 +2339,33 @@ async def premium_remove_slash(
 # MODERATION: MUTE + TEMPORARY BAN
 # =========================================================
 
-DURATION_RE = re.compile(r"(?P<value>\d+)\s*(?P<unit>[smd])", re.IGNORECASE)
+DURATION_RE = re.compile(r"(?P<value>\d+)\s*(?P<unit>[smhd])", re.IGNORECASE)
 MAX_TIMEOUT_SECONDS = 28 * 24 * 60 * 60
 
 
 def parse_duration(value: str):
-    """Parse durations such as 10s, 10m, 10d, or 10d10m10s."""
+    """Parse any combination/order of d, h, m and s."""
     if not value:
         return None
-
     compact = re.sub(r"\s+", "", value.strip().lower())
     matches = list(DURATION_RE.finditer(compact))
-
     if not matches or "".join(m.group(0) for m in matches) != compact:
         return None
-
-    total = 0
-    for match in matches:
-        amount = int(match.group("value"))
-        unit = match.group("unit").lower()
-        if unit == "s":
-            total += amount
-        elif unit == "m":
-            total += amount * 60
-        elif unit == "d":
-            total += amount * 86400
-
+    multipliers = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    total = sum(int(m.group("value")) * multipliers[m.group("unit").lower()] for m in matches)
     return total if total > 0 else None
 
 
 def format_duration(seconds: int):
     seconds = int(seconds)
     days, seconds = divmod(seconds, 86400)
+    hours, seconds = divmod(seconds, 3600)
     minutes, seconds = divmod(seconds, 60)
     parts = []
-    if days:
-        parts.append(f"{days}d")
-    if minutes:
-        parts.append(f"{minutes}m")
-    if seconds or not parts:
-        parts.append(f"{seconds}s")
+    if days: parts.append(f"{days}d")
+    if hours: parts.append(f"{hours}h")
+    if minutes: parts.append(f"{minutes}m")
+    if seconds or not parts: parts.append(f"{seconds}s")
     return "".join(parts)
 
 
@@ -2704,8 +2473,8 @@ async def _mute_member(member: discord.Member, duration_text: str, reason: str, 
     if seconds is None:
         return False, tr(
             channel_id,
-            "❌ Invalid duration. Use `s`, `m`, `d`, for example `10d10m10s`.",
-            "❌ Thời gian không hợp lệ. Dùng `s`, `m`, `d`, ví dụ `10d10m10s`."
+            "❌ Invalid duration. Use `s`, `m`, `h`, `d`, for example `10d10h10m10s` or any order such as `10h2d5m`.",
+            "❌ Thời gian không hợp lệ. Dùng `s`, `m`, `h`, `d`, ví dụ `10d10h10m10s` hoặc thứ tự bất kỳ như `10h2d5m`."
         )
 
     now = datetime.now(timezone.utc)
@@ -2735,110 +2504,217 @@ async def _mute_member(member: discord.Member, duration_text: str, reason: str, 
 
     return True, tr(
         channel_id,
-        f"🔇 {member.mention} muted for `{format_duration(seconds)}`.",
-        f"🔇 Đã mute {member.mention} trong `{format_duration(seconds)}`."
+        f"🔇 {member.mention} muted for `{format_duration(seconds)}`." + (f" Because {reason}" if reason.strip() else ""),
+        f"🔇 Đã mute {member.mention} trong `{format_duration(seconds)}`." + (f" Vì {reason}" if reason.strip() else "")
     )
 
 
-async def _ban_member(guild: discord.Guild, user_id: int, duration_text: str, reason: str, channel_id: int, member=None):
-    seconds = parse_duration(duration_text)
-    if seconds is None:
+async def _ban_member(guild: discord.Guild, user_id: int, reason: str, channel_id: int):
+    """Permanent Discord ban. The user stays banned until /unban or !unban."""
+    reason = reason.strip()
+    if not reason:
         return False, tr(
             channel_id,
-            "❌ Invalid duration. Use `s`, `m`, `d`, for example `10d10m10s`.",
-            "❌ Thời gian không hợp lệ. Dùng `s`, `m`, `d`, ví dụ `10d10m10s`."
+            "❌ Please provide a reason for the ban.",
+            "❌ Vui lòng nhập lý do ban."
         )
 
-    now_ts = __import__("time").time()
-    existing = get_temporary_ban(guild.id, user_id)
-    if existing and float(existing[0]) > now_ts:
-        expires_at = float(existing[0]) + seconds
-    else:
-        expires_at = now_ts + seconds
-
     try:
-        if member is not None:
-            await guild.ban(member, reason=reason or "Banned by moderator", delete_message_seconds=0)
-        else:
-            await guild.ban(discord.Object(id=user_id), reason=reason or "Banned by moderator", delete_message_seconds=0)
+        await guild.ban(
+            discord.Object(id=user_id),
+            reason=reason,
+            delete_message_seconds=0
+        )
     except discord.Forbidden:
         return False, tr(
             channel_id,
-            "❌ I cannot ban this member. Check my Ban Members permission and role position.",
-            "❌ Bot không thể ban thành viên này. Hãy kiểm tra quyền Ban Members và vị trí role của bot."
+            "❌ I cannot ban this user. Check my Ban Members permission and role position.",
+            "❌ Bot không thể ban người này. Hãy kiểm tra quyền Ban Members và vị trí role của bot."
         )
     except discord.HTTPException as e:
-        # Already banned: we can still extend the existing temporary-ban timer.
-        if getattr(e, "status", None) != 400:
-            print("[BAN ERROR]", repr(e))
-            return False, tr(channel_id, "❌ Could not ban this member.", "❌ Không thể ban thành viên này.")
+        print("[BAN ERROR]", repr(e))
+        return False, tr(
+            channel_id,
+            "❌ Could not ban this user.",
+            "❌ Không thể ban người này."
+        )
 
-    save_temporary_ban(guild.id, user_id, expires_at, reason or "Banned by moderator")
-    schedule_temporary_unban(guild.id, user_id, expires_at)
-
-    total_remaining = max(1, int(expires_at - now_ts))
     return True, tr(
         channel_id,
-        f"🔨 <@{user_id}> banned for `{format_duration(total_remaining)}`.",
-        f"🔨 Đã ban <@{user_id}> trong `{format_duration(total_remaining)}`."
+        f"🔨 <@{user_id}> has been banned." + f" Because {reason}",
+        f"🔨 Đã ban <@{user_id}>." + f" Vì {reason}"
     )
+
+
+def parse_user_id(value: str):
+    """Accept a raw Discord ID or a user mention."""
+    value = value.strip()
+    match = re.fullmatch(r"<?@!?(\d{15,25})>?", value)
+    if match:
+        return int(match.group(1))
+    if value.isdigit() and 15 <= len(value) <= 25:
+        return int(value)
+    return None
 
 
 @bot.tree.command(name="mute", description="Temporarily mute a member")
 @app_commands.describe(
-    member="Member to mute",
-    duration="Duration: 10s, 10m, 10d, or 10d10m10s",
+    member="User mention or Discord ID",
+    duration="Duration: 10s, 10m, 10h, 10d, or 10d10h10m10s",
     reason="Optional reason"
 )
 @app_commands.checks.has_permissions(moderate_members=True)
 async def mute_slash(
     interaction: discord.Interaction,
-    member: discord.Member,
+    member: str,
     duration: str,
     reason: str = ""
 ):
-    ok, message = await _mute_member(
-        member, duration, reason,
-        interaction.channel.id if interaction.channel else 0
-    )
+    channel_id = interaction.channel.id if interaction.channel else 0
+    user_id = parse_user_id(member)
+    if user_id is None:
+        await interaction.response.send_message(
+            tr(channel_id, "❌ Invalid user ID or mention.", "❌ ID người dùng hoặc mention không hợp lệ."),
+            ephemeral=True
+        )
+        return
+
+    try:
+        target = interaction.guild.get_member(user_id) or await interaction.guild.fetch_member(user_id)
+    except discord.NotFound:
+        await interaction.response.send_message(
+            tr(channel_id, "❌ That user is not a member of this server.", "❌ Người dùng đó không phải thành viên của server."),
+            ephemeral=True
+        )
+        return
+    except discord.HTTPException:
+        await interaction.response.send_message(
+            tr(channel_id, "❌ Could not find that member.", "❌ Không thể tìm thấy thành viên đó."),
+            ephemeral=True
+        )
+        return
+
+    ok, message = await _mute_member(target, duration, reason, channel_id)
     await interaction.response.send_message(message, ephemeral=not ok)
 
 
-@bot.tree.command(name="ban", description="Temporarily ban a member")
+@bot.tree.command(name="ban", description="Permanently ban a user")
 @app_commands.describe(
-    member="Member to ban",
-    duration="Duration: 10s, 10m, 10d, or 10d10m10s",
-    reason="Optional reason"
+    user="User mention or Discord ID",
+    reason="Reason for the ban"
 )
 @app_commands.checks.has_permissions(ban_members=True)
 async def ban_slash(
     interaction: discord.Interaction,
-    member: discord.Member,
-    duration: str,
-    reason: str = ""
+    user: str,
+    reason: str
 ):
-    ok, message = await _ban_member(
-        interaction.guild, member.id, duration, reason,
-        interaction.channel.id if interaction.channel else 0,
-        member
-    )
+    user_id = parse_user_id(user)
+    channel_id = interaction.channel.id if interaction.channel else 0
+    if user_id is None:
+        await interaction.response.send_message(
+            tr(channel_id, "❌ Invalid user ID or mention.", "❌ ID người dùng hoặc mention không hợp lệ."),
+            ephemeral=True
+        )
+        return
+
+    ok, message = await _ban_member(interaction.guild, user_id, reason, channel_id)
     await interaction.response.send_message(message, ephemeral=not ok)
 
 
 @bot.command(name="mute")
 @commands.has_guild_permissions(moderate_members=True)
-async def mute_prefix(ctx, member: discord.Member, duration: str, *, reason: str = ""):
-    ok, message = await _mute_member(member, duration, reason, ctx.channel.id)
+async def mute_prefix(ctx, member: str, duration: str, *, reason: str = ""):
+    user_id = parse_user_id(member)
+    if user_id is None:
+        await ctx.send(tr(ctx.channel.id, "❌ Invalid user ID or mention.", "❌ ID người dùng hoặc mention không hợp lệ."))
+        return
+
+    target = ctx.guild.get_member(user_id)
+    if target is None:
+        try:
+            target = await ctx.guild.fetch_member(user_id)
+        except discord.NotFound:
+            await ctx.send(tr(ctx.channel.id, "❌ That user is not a member of this server.", "❌ Người dùng đó không phải thành viên của server."))
+            return
+        except discord.HTTPException:
+            await ctx.send(tr(ctx.channel.id, "❌ Could not find that member.", "❌ Không thể tìm thấy thành viên đó."))
+            return
+
+    ok, message = await _mute_member(target, duration, reason, ctx.channel.id)
     await ctx.send(message)
 
 
 @bot.command(name="ban")
 @commands.has_guild_permissions(ban_members=True)
-async def ban_prefix(ctx, member: discord.Member, duration: str, *, reason: str = ""):
-    ok, message = await _ban_member(
-        ctx.guild, member.id, duration, reason, ctx.channel.id, member
-    )
+async def ban_prefix(ctx, user: str, *, reason: str = ""):
+    user_id = parse_user_id(user)
+    if user_id is None:
+        await ctx.send(tr(ctx.channel.id, "❌ Invalid user ID or mention.", "❌ ID người dùng hoặc mention không hợp lệ."))
+        return
+
+    ok, message = await _ban_member(ctx.guild, user_id, reason, ctx.channel.id)
     await ctx.send(message)
+
+
+async def _unmute_member(member: discord.Member, channel_id: int):
+    try:
+        await member.timeout(None, reason="Unmuted by moderator")
+        return True, tr(channel_id, f"🔊 {member.mention} is no longer muted.", f"🔊 Đã gỡ mute cho {member.mention}.")
+    except discord.Forbidden:
+        return False, tr(channel_id, "❌ I cannot unmute this member. Check my Moderate Members permission and role position.", "❌ Bot không thể gỡ mute. Hãy kiểm tra quyền Moderate Members và vị trí role của bot.")
+    except Exception as e:
+        print("[UNMUTE ERROR]",repr(e)); return False, tr(channel_id,"❌ Could not unmute this member.","❌ Không thể gỡ mute thành viên này.")
+
+
+async def _unban_member(guild: discord.Guild, user_id: int, channel_id: int):
+    try:
+        await guild.unban(discord.Object(id=user_id), reason="Unbanned by moderator")
+    except discord.NotFound:
+        remove_temporary_ban(guild.id,user_id); task=temporary_ban_tasks.pop((guild.id,user_id),None)
+        if task and not task.done(): task.cancel()
+        return False,tr(channel_id,"❌ This user is not banned.","❌ User này hiện không bị ban.")
+    except discord.Forbidden:
+        return False,tr(channel_id,"❌ I cannot unban this user. Check my Ban Members permission.","❌ Bot không thể unban user này. Hãy kiểm tra quyền Ban Members.")
+    except Exception as e:
+        print("[UNBAN ERROR]",repr(e)); return False,tr(channel_id,"❌ Could not unban this user.","❌ Không thể unban user này.")
+    remove_temporary_ban(guild.id,user_id); task=temporary_ban_tasks.pop((guild.id,user_id),None)
+    if task and not task.done(): task.cancel()
+    return True,tr(channel_id,f"🔓 <@{user_id}> has been unbanned.",f"🔓 Đã unban <@{user_id}>.")
+
+
+@bot.tree.command(name="unmute",description="Remove a member's timeout")
+@app_commands.describe(member="Member to unmute")
+@app_commands.checks.has_permissions(moderate_members=True)
+async def unmute_slash(interaction: discord.Interaction, member: discord.Member):
+    ok,message=await _unmute_member(member,interaction.channel.id if interaction.channel else 0)
+    await interaction.response.send_message(message,ephemeral=not ok)
+
+
+@bot.tree.command(name="unban",description="Unban a user by ID")
+@app_commands.describe(user_id="The Discord user ID to unban")
+@app_commands.checks.has_permissions(ban_members=True)
+async def unban_slash(interaction: discord.Interaction,user_id:str):
+    try: uid=int(user_id.strip())
+    except (ValueError,AttributeError):
+        await interaction.response.send_message(tr(interaction.channel.id if interaction.channel else 0,"❌ User ID must be a number.","❌ User ID phải là số."),ephemeral=True); return
+    ok,message=await _unban_member(interaction.guild,uid,interaction.channel.id if interaction.channel else 0)
+    await interaction.response.send_message(message,ephemeral=not ok)
+
+
+@bot.command(name="unmute")
+@commands.has_guild_permissions(moderate_members=True)
+async def unmute_prefix(ctx,member:discord.Member):
+    ok,message=await _unmute_member(member,ctx.channel.id); await ctx.send(message)
+
+
+@bot.command(name="unban")
+@commands.has_guild_permissions(ban_members=True)
+async def unban_prefix(ctx,user_id:str):
+    try: uid=int(user_id.strip())
+    except (ValueError,AttributeError):
+        await ctx.send(tr(ctx.channel.id,"❌ User ID must be a number.","❌ User ID phải là số.")); return
+    ok,message=await _unban_member(ctx.guild,uid,ctx.channel.id); await ctx.send(message)
 
 
 # =========================================================
@@ -3241,64 +3117,6 @@ async def on_command_error(ctx, error):
 
 
 # =========================================================
-# AI FIFO QUEUE
-# =========================================================
-
-async def process_ai_queue_job(message, prompt):
-    """Process one AI message: think ~2s, call AI, send response, then cooldown."""
-    try:
-        await asyncio.sleep(AI_THINK_DELAY)
-        async with message.channel.typing():
-            answer = await ask_ai_async(message.guild.id, prompt)
-
-        if answer:
-            await send_ai_response(message, answer)
-            task = asyncio.create_task(learn_from_message(message))
-            learning_tasks.setdefault(message.guild.id, set()).add(task)
-            task.add_done_callback(lambda t: learning_tasks[message.guild.id].discard(t))
-        else:
-            is_free = get_plan(message.guild.id) == PLAN_FREE
-            await message.channel.send(
-                tr(
-                    message.channel.id,
-                    "⚠️ All free AI providers are temporarily unavailable. Please try again later." if is_free else "⚠️ Premium AI did not return a response.",
-                    "⚠️ Tất cả AI miễn phí hiện không phản hồi. Vui lòng thử lại sau." if is_free else "⚠️ Premium AI không trả về phản hồi.",
-                )
-            )
-    except Exception as e:
-        print("[AI QUEUE ERROR]", repr(e))
-        try:
-            await message.channel.send(
-                tr(message.channel.id, "⚠️ An error occurred while processing AI.", "⚠️ Có lỗi khi xử lý AI.")
-            )
-        except Exception:
-            pass
-    finally:
-        await asyncio.sleep(AI_MESSAGE_COOLDOWN)
-
-
-async def ai_queue_worker():
-    print("[AI QUEUE] Worker started. FIFO mode ON.")
-    while True:
-        message, prompt, future = await ai_reply_queue.get()
-        try:
-            await process_ai_queue_job(message, prompt)
-            if not future.done():
-                future.set_result(True)
-        except Exception as e:
-            if not future.done():
-                future.set_exception(e)
-        finally:
-            ai_reply_queue.task_done()
-
-
-def ensure_ai_queue_worker():
-    global ai_queue_worker_task
-    if ai_queue_worker_task is None or ai_queue_worker_task.done():
-        ai_queue_worker_task = asyncio.create_task(ai_queue_worker())
-
-
-# =========================================================
 # MESSAGE EVENT
 # =========================================================
 
@@ -3377,17 +3195,57 @@ async def on_message(message: discord.Message):
         await bot.process_commands(message)
         return
 
-    ensure_ai_queue_worker()
-    prompt = build_ai_prompt(message)
-    loop = asyncio.get_running_loop()
-    future = loop.create_future()
-    await ai_reply_queue.put((message, prompt, future))
-    print(f"[AI QUEUE] +1 {message.author} in #{message.channel.name} | waiting={ai_reply_queue.qsize()}")
-
     try:
-        await future
+        prompt = build_ai_prompt(message)
+
+        async with message.channel.typing():
+            answer = await ask_ai_async(guild_id, prompt)
+
+        if not answer:
+            if get_plan(guild_id) == PLAN_FREE:
+                error_en = "⚠️ Gemini did not return a response. Check GEMINI_API_KEY, the Gemini model, or the API quota."
+                error_vi = "⚠️ Gemini không trả về phản hồi. Hãy kiểm tra GEMINI_API_KEY, model Gemini hoặc giới hạn API."
+            else:
+                error_en = "⚠️ Premium AI did not return a response. Check OPENAI_API_KEY, the OpenAI model, or the API quota."
+                error_vi = "⚠️ Premium AI không trả về phản hồi. Hãy kiểm tra OPENAI_API_KEY, model OpenAI hoặc giới hạn API."
+
+            await message.channel.send(
+                tr(message.channel.id, error_en, error_vi)
+            )
+        else:
+            await send_ai_response(
+                message,
+                answer
+            )
+
+            task = asyncio.create_task(
+                learn_from_message(message)
+            )
+
+            learning_tasks.setdefault(
+                guild_id,
+                set()
+            )
+
+            learning_tasks[guild_id].add(task)
+
+            task.add_done_callback(
+                lambda t: learning_tasks[guild_id].discard(t)
+            )
+
     except Exception as e:
-        print("[AI QUEUE WAIT ERROR]", repr(e))
+        print("[AI ERROR]", e)
+
+        try:
+            await message.channel.send(
+                tr(
+                    message.channel.id,
+                    "⚠️ An error occurred while processing AI.",
+                    "⚠️ Có lỗi khi xử lý AI.",
+                )
+            )
+        except Exception:
+            pass
 
     await bot.process_commands(message)
 
@@ -3436,6 +3294,8 @@ for _command in (
     avatar_slash,
     mute_slash,
     ban_slash,
+    unmute_slash,
+    unban_slash,
 ):
     _command.error(generic_app_command_error)
 
