@@ -1129,22 +1129,38 @@ def ask_gemini(prompt):
                 print(f"[GEMINI ERROR] Empty response with key #{slot}.")
                 return None
 
-            # 429 = quota/rate limit: chuyển key ngay.
-            # 401/403: key có thể hết hạn/quyền không hợp lệ: cũng thử key kế tiếp.
+            try:
+                detail = response.json().get("error", {}).get("message", response.text)
+                api_status = response.json().get("error", {}).get("status", "")
+            except Exception:
+                detail = response.text
+                api_status = ""
+
+            # These responses indicate a server/location/model access problem,
+            # not a bad individual API key. Do not burn through all 100 keys.
+            detail_lower = str(detail).lower()
+            if (response.status_code == 400 and (
+                    api_status == "FAILED_PRECONDITION" or
+                    "user location is not supported" in detail_lower
+                )):
+                print(f"[GEMINI ERROR] Location/API precondition issue (HTTP 400, key #{slot}); not rotating keys.")
+                return None
+
+            if response.status_code == 403 and (
+                    "<!doctype html" in response.text.lower() or
+                    "<html" in response.text.lower() or
+                    "your client does not have permission to get url" in detail_lower
+                ):
+                print(f"[GEMINI ERROR] Google server returned HTML 403 for model {GEMINI_MODEL}; not rotating keys. Check model access and Wispbyte outbound network/IP.")
+                return None
+
+            # 429 quota/rate-limit and API JSON 401/403 may be key-specific.
             if response.status_code in (401, 403, 429):
-                try:
-                    detail = response.json().get("error", {}).get("message", response.text)
-                except Exception:
-                    detail = response.text
-                print(f"[GEMINI] Key #{slot} unavailable HTTP {response.status_code}: {detail}")
+                print(f"[GEMINI] Key #{slot} unavailable HTTP {response.status_code}: {str(detail)[:300]}")
                 _rotate_gemini_key(key_index)
                 continue
 
-            try:
-                detail = response.json().get("error", {}).get("message", response.text)
-            except Exception:
-                detail = response.text
-            print(f"[GEMINI ERROR] HTTP {response.status_code} with key #{slot}: {detail}")
+            print(f"[GEMINI ERROR] HTTP {response.status_code} with key #{slot}: {str(detail)[:300]}")
             return None
 
         except requests.RequestException as e:
@@ -2511,18 +2527,13 @@ async def _mute_member(member: discord.Member, duration_text: str, reason: str, 
 
 async def _ban_member(guild: discord.Guild, user_id: int, reason: str, channel_id: int):
     """Permanent Discord ban. The user stays banned until /unban or !unban."""
-    reason = reason.strip()
-    if not reason:
-        return False, tr(
-            channel_id,
-            "❌ Please provide a reason for the ban.",
-            "❌ Vui lòng nhập lý do ban."
-        )
+    reason = (reason or "").strip()
+    audit_reason = reason or "Banned by moderator (no reason provided)"
 
     try:
         await guild.ban(
             discord.Object(id=user_id),
-            reason=reason,
+            reason=audit_reason,
             delete_message_seconds=0
         )
     except discord.Forbidden:
@@ -2541,8 +2552,8 @@ async def _ban_member(guild: discord.Guild, user_id: int, reason: str, channel_i
 
     return True, tr(
         channel_id,
-        f"🔨 <@{user_id}> has been banned." + f" Because {reason}",
-        f"🔨 Đã ban <@{user_id}>." + f" Vì {reason}"
+        f"🔨 <@{user_id}> has been banned." + (f" Because {reason}" if reason else ""),
+        f"🔨 Đã ban <@{user_id}>." + (f" Vì {reason}" if reason else "")
     )
 
 
@@ -2601,13 +2612,13 @@ async def mute_slash(
 @bot.tree.command(name="ban", description="Permanently ban a user")
 @app_commands.describe(
     user="User mention or Discord ID",
-    reason="Reason for the ban"
+    reason="Optional reason"
 )
 @app_commands.checks.has_permissions(ban_members=True)
 async def ban_slash(
     interaction: discord.Interaction,
     user: str,
-    reason: str
+    reason: str = ""
 ):
     user_id = parse_user_id(user)
     channel_id = interaction.channel.id if interaction.channel else 0
@@ -2657,64 +2668,93 @@ async def ban_prefix(ctx, user: str, *, reason: str = ""):
     await ctx.send(message)
 
 
-async def _unmute_member(member: discord.Member, channel_id: int):
+async def _unmute_member(member: discord.Member, channel_id: int, reason: str = ""):
+    reason = reason.strip()
+    audit_reason = f"Unmuted by moderator: {reason}" if reason else "Unmuted by moderator"
     try:
-        await member.timeout(None, reason="Unmuted by moderator")
-        return True, tr(channel_id, f"🔊 {member.mention} is no longer muted.", f"🔊 Đã gỡ mute cho {member.mention}.")
+        await member.timeout(None, reason=audit_reason)
+        suffix_en = f" Because {reason}" if reason else ""
+        suffix_vi = f" Vì {reason}" if reason else ""
+        return True, tr(
+            channel_id,
+            f"🔊 {member.mention} is no longer muted." + suffix_en,
+            f"🔊 Đã gỡ mute cho {member.mention}." + suffix_vi
+        )
     except discord.Forbidden:
         return False, tr(channel_id, "❌ I cannot unmute this member. Check my Moderate Members permission and role position.", "❌ Bot không thể gỡ mute. Hãy kiểm tra quyền Moderate Members và vị trí role của bot.")
     except Exception as e:
-        print("[UNMUTE ERROR]",repr(e)); return False, tr(channel_id,"❌ Could not unmute this member.","❌ Không thể gỡ mute thành viên này.")
+        print("[UNMUTE ERROR]", repr(e))
+        return False, tr(channel_id, "❌ Could not unmute this member.", "❌ Không thể gỡ mute thành viên này.")
 
 
-async def _unban_member(guild: discord.Guild, user_id: int, channel_id: int):
+async def _unban_member(guild: discord.Guild, user_id: int, channel_id: int, reason: str = ""):
+    reason = reason.strip()
+    audit_reason = f"Unbanned by moderator: {reason}" if reason else "Unbanned by moderator"
     try:
-        await guild.unban(discord.Object(id=user_id), reason="Unbanned by moderator")
+        await guild.unban(discord.Object(id=user_id), reason=audit_reason)
     except discord.NotFound:
-        remove_temporary_ban(guild.id,user_id); task=temporary_ban_tasks.pop((guild.id,user_id),None)
-        if task and not task.done(): task.cancel()
-        return False,tr(channel_id,"❌ This user is not banned.","❌ User này hiện không bị ban.")
+        remove_temporary_ban(guild.id, user_id)
+        task = temporary_ban_tasks.pop((guild.id, user_id), None)
+        if task and not task.done():
+            task.cancel()
+        return False, tr(channel_id, "❌ This user is not banned.", "❌ User này hiện không bị ban.")
     except discord.Forbidden:
-        return False,tr(channel_id,"❌ I cannot unban this user. Check my Ban Members permission.","❌ Bot không thể unban user này. Hãy kiểm tra quyền Ban Members.")
+        return False, tr(channel_id, "❌ I cannot unban this user. Check my Ban Members permission.", "❌ Bot không thể unban user này. Hãy kiểm tra quyền Ban Members.")
     except Exception as e:
-        print("[UNBAN ERROR]",repr(e)); return False,tr(channel_id,"❌ Could not unban this user.","❌ Không thể unban user này.")
-    remove_temporary_ban(guild.id,user_id); task=temporary_ban_tasks.pop((guild.id,user_id),None)
-    if task and not task.done(): task.cancel()
-    return True,tr(channel_id,f"🔓 <@{user_id}> has been unbanned.",f"🔓 Đã unban <@{user_id}>.")
+        print("[UNBAN ERROR]", repr(e))
+        return False, tr(channel_id, "❌ Could not unban this user.", "❌ Không thể unban user này.")
+
+    remove_temporary_ban(guild.id, user_id)
+    task = temporary_ban_tasks.pop((guild.id, user_id), None)
+    if task and not task.done():
+        task.cancel()
+    suffix_en = f" Because {reason}" if reason else ""
+    suffix_vi = f" Vì {reason}" if reason else ""
+    return True, tr(
+        channel_id,
+        f"🔓 <@{user_id}> has been unbanned." + suffix_en,
+        f"🔓 Đã unban <@{user_id}>." + suffix_vi
+    )
 
 
-@bot.tree.command(name="unmute",description="Remove a member's timeout")
-@app_commands.describe(member="Member to unmute")
+@bot.tree.command(name="unmute", description="Remove a member's timeout")
+@app_commands.describe(member="Member to unmute", reason="Optional reason")
 @app_commands.checks.has_permissions(moderate_members=True)
-async def unmute_slash(interaction: discord.Interaction, member: discord.Member):
-    ok,message=await _unmute_member(member,interaction.channel.id if interaction.channel else 0)
-    await interaction.response.send_message(message,ephemeral=not ok)
+async def unmute_slash(interaction: discord.Interaction, member: discord.Member, reason: str = ""):
+    ok, message = await _unmute_member(member, interaction.channel.id if interaction.channel else 0, reason)
+    await interaction.response.send_message(message, ephemeral=not ok)
 
 
-@bot.tree.command(name="unban",description="Unban a user by ID")
-@app_commands.describe(user_id="The Discord user ID to unban")
+@bot.tree.command(name="unban", description="Unban a user by ID")
+@app_commands.describe(user_id="The Discord user ID to unban", reason="Optional reason")
 @app_commands.checks.has_permissions(ban_members=True)
-async def unban_slash(interaction: discord.Interaction,user_id:str):
-    try: uid=int(user_id.strip())
-    except (ValueError,AttributeError):
-        await interaction.response.send_message(tr(interaction.channel.id if interaction.channel else 0,"❌ User ID must be a number.","❌ User ID phải là số."),ephemeral=True); return
-    ok,message=await _unban_member(interaction.guild,uid,interaction.channel.id if interaction.channel else 0)
-    await interaction.response.send_message(message,ephemeral=not ok)
+async def unban_slash(interaction: discord.Interaction, user_id: str, reason: str = ""):
+    try:
+        uid = int(user_id.strip())
+    except (ValueError, AttributeError):
+        await interaction.response.send_message(tr(interaction.channel.id if interaction.channel else 0, "❌ User ID must be a number.", "❌ User ID phải là số."), ephemeral=True)
+        return
+    ok, message = await _unban_member(interaction.guild, uid, interaction.channel.id if interaction.channel else 0, reason)
+    await interaction.response.send_message(message, ephemeral=not ok)
 
 
 @bot.command(name="unmute")
 @commands.has_guild_permissions(moderate_members=True)
-async def unmute_prefix(ctx,member:discord.Member):
-    ok,message=await _unmute_member(member,ctx.channel.id); await ctx.send(message)
+async def unmute_prefix(ctx, member: discord.Member, *, reason: str = ""):
+    ok, message = await _unmute_member(member, ctx.channel.id, reason)
+    await ctx.send(message)
 
 
 @bot.command(name="unban")
 @commands.has_guild_permissions(ban_members=True)
-async def unban_prefix(ctx,user_id:str):
-    try: uid=int(user_id.strip())
-    except (ValueError,AttributeError):
-        await ctx.send(tr(ctx.channel.id,"❌ User ID must be a number.","❌ User ID phải là số.")); return
-    ok,message=await _unban_member(ctx.guild,uid,ctx.channel.id); await ctx.send(message)
+async def unban_prefix(ctx, user_id: str, *, reason: str = ""):
+    try:
+        uid = int(user_id.strip())
+    except (ValueError, AttributeError):
+        await ctx.send(tr(ctx.channel.id, "❌ User ID must be a number.", "❌ User ID phải là số."))
+        return
+    ok, message = await _unban_member(ctx.guild, uid, ctx.channel.id, reason)
+    await ctx.send(message)
 
 
 # =========================================================
