@@ -1,7 +1,6 @@
-discord.py
-python-dotenv
-requests
-Pillow
-imageio
-imageio-ffmpeg
-openai
+discord.py>=2.4.0
+python-dotenv>=1.0.0
+Pillow>=10.0.0
+openai>=1.0.0
+google-genai>=1.0.0
+requests>=2.31.0
