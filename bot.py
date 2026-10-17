@@ -1083,11 +1083,6 @@ def ask_gemini(prompt):
         tried.add(key_index)
 
         endpoint_path = f"/v1beta/models/{GEMINI_MODEL}:generateContent"
-        if GEMINI_PROXY_URL:
-            # Worker forwards this path to Google's official Gemini REST API.
-            url = GEMINI_PROXY_URL + endpoint_path
-        else:
-            url = "https://generativelanguage.googleapis.com" + endpoint_path
         payload = {
             "contents": [
                 {
@@ -1103,15 +1098,24 @@ def ask_gemini(prompt):
 
         try:
             request_headers = {"Content-Type": "application/json"}
+            request_params = None
+
             if GEMINI_PROXY_URL:
                 if not GEMINI_PROXY_TOKEN:
                     print("[GEMINI PROXY ERROR] GEMINI_PROXY_URL is set but GEMINI_PROXY_TOKEN is missing.")
                     return None
-                request_headers["x-toilix-proxy-token"] = GEMINI_PROXY_TOKEN
+
+                url = GEMINI_PROXY_URL
+                request_params = {"model": GEMINI_MODEL}
+                request_headers["X-Proxy-Token"] = GEMINI_PROXY_TOKEN
+                request_headers["X-Gemini-Key"] = api_key
+            else:
+                url = "https://generativelanguage.googleapis.com" + endpoint_path
+                request_params = {"key": api_key}
 
             response = requests.post(
                 url,
-                params={"key": api_key},
+                params=request_params,
                 headers=request_headers,
                 json=payload,
                 timeout=120,
