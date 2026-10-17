@@ -1,9 +1,8 @@
-
 export default {
   async fetch(request, env) {
     if (request.method !== "POST") {
       return new Response("Method Not Allowed", {
-        status: 405
+        status: 405,
       });
     }
 
@@ -11,8 +10,8 @@ export default {
     const suppliedToken = request.headers.get("X-Proxy-Token");
 
     if (!expectedToken || suppliedToken !== expectedToken) {
-      return new Response("Unauthorized", {
-        status: 401
+      return new Response("Unauthorized: proxy token mismatch", {
+        status: 401,
       });
     }
 
@@ -21,7 +20,7 @@ export default {
 
     if (!model || !/^[a-zA-Z0-9._-]+$/.test(model)) {
       return new Response("Invalid model", {
-        status: 400
+        status: 400,
       });
     }
 
@@ -29,7 +28,7 @@ export default {
 
     if (!apiKey) {
       return new Response("Missing Gemini API key", {
-        status: 400
+        status: 400,
       });
     }
 
@@ -40,7 +39,7 @@ export default {
       JSON.parse(body);
     } catch {
       return new Response("Invalid JSON body", {
-        status: 400
+        status: 400,
       });
     }
 
@@ -51,9 +50,9 @@ export default {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            "x-goog-api-key": apiKey
+            "x-goog-api-key": apiKey,
           },
-          body
+          body,
         }
       );
 
@@ -62,13 +61,13 @@ export default {
         headers: {
           "Content-Type":
             response.headers.get("Content-Type") || "application/json",
-          "Cache-Control": "no-store"
-        }
+          "Cache-Control": "no-store",
+        },
       });
     } catch {
       return new Response("Upstream request failed", {
-        status: 502
+        status: 502,
       });
     }
-  }
+  },
 };
